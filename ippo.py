@@ -28,7 +28,7 @@ CONFIG = {
     "LR": 0.0005,
     "NUM_ENVS": 32,
     "NUM_STEPS": 1000,
-    "TOTAL_TIMESTEPS": 3e8,
+    "TOTAL_TIMESTEPS": 1.5e8,
     "UPDATE_EPOCHS": 2,
     "NUM_MINIBATCHES": 500,
     "GAMMA": 0.99,
@@ -53,14 +53,14 @@ CONFIG = {
     "NUM_SEEDS": 1,
     "TUNE": False,
 
-    "REWARD": "individual", # individual; common
+    "REWARD": "common", # individual; common NOTE: this does nothing. Change above.
     "GIF_NUM_FRAMES": 250,
     "PARAMETER_SHARING": True,
     # WandB Params
     "ENTITY": "",
     "PROJECT": "socialjax",
     "WANDB_MODE" : "online",
-    "WANDB_TAGS": ["individual_reward"],
+    "WANDB_TAGS": ["common_reward"],
 }
 
 class CNN(nn.Module):
