@@ -44,6 +44,7 @@ class State:
     potential_dirt_and_dirt_locs: jnp.ndarray
     potential_dirt_and_dirt_label: jnp.ndarray
     smooth_rewards: jnp.ndarray
+    cumulative_apples_collected: jnp.ndarray
 
 
 @chex.dataclass
@@ -186,7 +187,7 @@ class Clean_up(MultiAgentEnv):
         num_inner_steps=1000,
         num_outer_steps=1,
         num_agents=7,
-        shared_rewards=True,
+        reward_type="shared",  # "shared", "individual", or "saturating"
         inequity_aversion=False,
         inequity_aversion_target_agents=None,
         inequity_aversion_alpha=5,
@@ -205,6 +206,7 @@ class Clean_up(MultiAgentEnv):
         
         obs_size=11,
         cnn=True,
+        agent_ids=False,
 
         map_ASCII = [
                 'HFFFHFFHFHFHFHFHFHFHHFHFFFHF',
@@ -236,7 +238,7 @@ class Clean_up(MultiAgentEnv):
         self.thresholdRestoration = thresholdRestoration
         self.dirtSpawnProbability = dirtSpawnProbability
         self.delayStartOfDirtSpawning = delayStartOfDirtSpawning
-        self.shared_rewards = shared_rewards
+        self.reward_type = reward_type
         self.inequity_aversion = inequity_aversion
         self.inequity_aversion_target_agents = inequity_aversion_target_agents
         self.inequity_aversion_alpha = inequity_aversion_alpha
@@ -247,6 +249,7 @@ class Clean_up(MultiAgentEnv):
         self.svo_ideal_angle_degrees = svo_ideal_angle_degrees
         self.smooth_rewards = enable_smooth_rewards
         self.cnn = cnn
+        self.agent_ids = agent_ids
         self.num_inner_steps = num_inner_steps
         self.num_outer_steps = num_outer_steps
 
@@ -284,8 +287,6 @@ class Clean_up(MultiAgentEnv):
         self.POTENTIAL_DIRT = find_positions(nums_map, char_to_int['H'])
         self.DIRT = find_positions(nums_map, char_to_int['F'])
 
-
-        
         def check_collision(
                 new_agent_locs: jnp.ndarray
             ) -> jnp.ndarray:
@@ -310,9 +311,6 @@ class Clean_up(MultiAgentEnv):
             )(new_agent_locs, new_agent_locs)
 
             return collisions
-        
-        # first attempt at func - needs improvement
-        # inefficient due to double-checking collisions
         
         def fix_collisions(
             key: jnp.ndarray,
@@ -454,43 +452,6 @@ class Clean_up(MultiAgentEnv):
                 [False] * collisions.shape[0]
             )
             return ((k2, collided_moved, collision_matrix, agent_locs, new_agent_locs), new_agent_locs)
-
-        def to_dict(
-                agent: int,
-                obs: jnp.ndarray,
-                agent_invs: jnp.ndarray,
-                agent_pickups: jnp.ndarray,
-                inv_to_show: jnp.ndarray
-            ) -> dict:
-            '''
-            Function to produce observation/state dictionaries.
-            
-            Args:
-                - agent: int, number identifying agent
-                - obs: jnp.ndarray, the combined grid observations for each
-                agent
-                - agent_invs: jnp.ndarray of current agents' inventories
-                - agent_pickups: boolean indicators of interaction
-                - inv_to_show: jnp.ndarray inventory to show to other agents
-                
-            Returns:
-                - dictionary of full state observation.
-            '''
-            idx = agent - len(Items)
-            state_dict = {
-                "observation": obs,
-                "inventory": {
-                    "agent_inv": agent_invs,
-                    "agent_pickups": agent_pickups,
-                    "invs_to_show": jnp.delete(
-                        inv_to_show,
-                        idx,
-                        assume_unique_indices=True
-                    )
-                }
-            }
-
-            return state_dict
         
         def combine_channels(
                 grid: jnp.ndarray,
@@ -782,6 +743,42 @@ class Clean_up(MultiAgentEnv):
                 state
             )
 
+            # Add coefficient channel showing relative apple collection
+            def add_coef_channel(grid, agent_idx):
+                # Calculate coefficient for this agent
+                agent_apple_counts = state.cumulative_apples_collected
+                max_apples = jnp.max(agent_apple_counts)
+                
+                # Check if this agent has the maximum number of apples
+                has_max_apples = agent_apple_counts[agent_idx] == max_apples
+                
+                # Coefficient: 1.0 if agent has max apples (will be penalized), 0.0 otherwise
+                coef = jnp.where(has_max_apples, 1.0, 0.0)
+                
+                # Create channel filled with coefficient value (normalized to 0-255 for int8)
+                coef_channel = jnp.full((self.OBS_SIZE, self.OBS_SIZE, 1), 
+                                       jnp.round(coef * 255).astype(jnp.int8))
+                
+                # Concatenate with existing observation
+                return jnp.concatenate([grid, coef_channel], axis=-1)
+
+            # Apply coefficient channel to all agent observations
+            grids = jax.vmap(add_coef_channel, in_axes=(0, 0))(grids, jnp.arange(num_agents))
+
+            # Add agent ID channels if enabled
+            if self.agent_ids:
+                # Create agent ID channels for each agent
+                def add_agent_id_channels(grid, agent_idx):
+                    # Create num_agents channels, all zeros
+                    agent_id_channels = jnp.zeros((self.OBS_SIZE, self.OBS_SIZE, num_agents), dtype=jnp.int8)
+                    # Set the channel corresponding to this agent's ID to all ones
+                    agent_id_channels = agent_id_channels.at[:, :, agent_idx].set(1)
+                    # Concatenate with existing observation
+                    return jnp.concatenate([grid, agent_id_channels], axis=-1)
+
+                # Apply agent ID channels to all agent observations
+                grids = jax.vmap(add_agent_id_channels, in_axes=(0, 0))(grids, self._agents)
+
             return grids
 
 
@@ -851,7 +848,6 @@ class Clean_up(MultiAgentEnv):
                 target_right
             )
 
-
             target_left = jax.vmap(
                 lambda p: p + STEP[p[2]] + STEP[(p[2] - 1) % 4]
             )(state.agent_locs)
@@ -881,7 +877,6 @@ class Clean_up(MultiAgentEnv):
                 return jnp.where(z, state.grid[a[0], a[1]], -1)
 
             all_zaped_gird = jax.vmap(zaped_gird)(all_zaped_locs, zaps_4_locs)
-            # jax.debug.print("all_zaped_gird {all_zaped_gird} 🤯", all_zaped_gird=all_zaped_gird)
 
             def check_reborn_player(a):
                 return jnp.isin(a, all_zaped_gird)
@@ -939,7 +934,7 @@ class Clean_up(MultiAgentEnv):
                     )
 
             qualified_to_zap = zaps.squeeze()
-            # jax.debug.print("qualified_to_zap {qualified_to_zap} 🤯", qualified_to_zap=qualified_to_zap)
+
             # update grid
             def update_grid(a_i, t, i, grid):
                 return grid.at[t[:, 0], t[:, 1]].set(
@@ -949,17 +944,12 @@ class Clean_up(MultiAgentEnv):
                         aux_grid[t[:, 0], t[:, 1]]
                     )
                 )
-            # def update_grid(a_i, t, i, grid):
-            #     return grid.at[t[:, 0], t[:, 1]].set(2)
 
-
-            # jax.debug.print("one_step_targets {one_step_targets} 🤯", one_step_targets=one_step_targets)
             aux_grid = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid)
             aux_grid = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid)
             aux_grid = update_grid(qualified_to_zap, target_right, r_items, aux_grid)
             aux_grid = update_grid(qualified_to_zap, target_left, l_items, aux_grid)
 
-            # jax.debug.print("aux_grid {aux_grid} 🤯", aux_grid=aux_grid)
             state = state.replace(
                 grid=jnp.where(
                     jnp.any(zaps),
@@ -1000,7 +990,6 @@ class Clean_up(MultiAgentEnv):
             state = state.replace(grid=jnp.where(
                 state.grid == interact_idx, jnp.int16(Items.empty), state.grid
             ))
-
 
             one_step_targets = jax.vmap(
                 lambda p: p + STEP[p[2]]
@@ -1081,7 +1070,6 @@ class Clean_up(MultiAgentEnv):
                 potential_dirt_and_dirt_label=renew_label
             )
 
-            
             aux_grid = jnp.copy(state.grid)
 
             o_items = jnp.where(
@@ -1210,7 +1198,6 @@ class Clean_up(MultiAgentEnv):
             label_with_noise_rank_new = label_with_noise_rank.at[0].set(one_piece_dirt[0]) 
 
             label_rank_new = jnp.round(label_with_noise_rank_new).astype(jnp.int16)
-            
 
             state = state.replace(potential_dirt_and_dirt_label=label_rank_new)
             state = state.replace(potential_dirt_and_dirt_locs=unstable_sorted_locs)
@@ -1226,8 +1213,6 @@ class Clean_up(MultiAgentEnv):
             new_grid = new_grid.at[state.potential_dirt_and_dirt_locs[:, 0], state.potential_dirt_and_dirt_locs[:, 1]].set(state.potential_dirt_and_dirt_label)
             
             new_grid = new_grid.at[self.RIVER[:, 0], self.RIVER[:, 1]].set(Items.river)
-
-
 
             x, y = state.reborn_locs[:, 0], state.reborn_locs[:, 1]
             new_grid = new_grid.at[x, y].set(self._agents)
@@ -1295,21 +1280,14 @@ class Clean_up(MultiAgentEnv):
             
             apple_matches = jax.vmap(coin_matcher)(p=new_locs)
 
-            # # individual rewards
-            # rewards = jnp.zeros((self.num_agents, 1))
-            # rewards = jnp.where(apple_matches, 1, rewards)
-
-            # # single reward or sum reward
-
-            # rewards_sum_all_agents = jnp.zeros((self.num_agents, 1))
-            # rewards_sum = jnp.sum(rewards)
-            # rewards_sum_all_agents += rewards_sum
-            # rewards = rewards_sum_all_agents
-
             new_invs = state.agent_invs + apple_matches
+            
+            # Update cumulative apple collection
+            new_cumulative_apples = state.cumulative_apples_collected + apple_matches.squeeze()
 
             state = state.replace(
-                agent_invs=new_invs
+                agent_invs=new_invs,
+                cumulative_apples_collected=new_cumulative_apples
             )
 
             # update grid
@@ -1357,53 +1335,47 @@ class Clean_up(MultiAgentEnv):
             new_re_locs = jnp.where(reborn_players.any(), new_re_locs, state.agent_locs)
             state = state.replace(reborn_locs=new_re_locs)
 
-            if self.shared_rewards:
-                rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards)
-
+            # Calculate base rewards
+            base_rewards = jnp.zeros((self.num_agents, 1))
+            base_apple_rewards = jnp.where(apple_matches, 1, base_rewards)
+            
+            # Apply reward type logic
+            if self.reward_type == "shared":
+                # Shared rewards: all agents get sum of all rewards
                 rewards_sum_all_agents = jnp.zeros((self.num_agents, 1))
-                rewards_sum = jnp.sum(original_rewards)
+                rewards_sum = jnp.sum(base_apple_rewards)
                 rewards_sum_all_agents += rewards_sum
                 rewards = rewards_sum_all_agents
                 info = {
-                    "original_rewards": original_rewards.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
+                    "individual_rewards": base_apple_rewards.squeeze(),
                 }
-            elif self.inequity_aversion:
-                rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
-                if self.smooth_rewards:
-                    should_smooth = (state.inner_t % 1) == 0
-                    new_smooth_rewards = 0.99 * 0.01* state.smooth_rewards + original_rewards
-                    rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(new_smooth_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
-                    state = state.replace(smooth_rewards=new_smooth_rewards)
-                    info = {
-                    "original_rewards": original_rewards.squeeze(),
-                    "smooth_rewards": state.smooth_rewards.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
-                }
-                else:
-                    rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(original_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
-                    info = {
-                    "original_rewards": original_rewards.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
-                }
-            elif self.svo:
-                rewards = jnp.zeros((self.num_agents, 1))
-                original_rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
-                rewards, theta = self.get_svo_rewards(original_rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
-                info = {
-                    "original_rewards": original_rewards.squeeze(),
-                    "svo_theta": theta.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
-                }
+            elif self.reward_type == "individual":
+                # Individual rewards: each agent gets only their own rewards
+                rewards = base_apple_rewards * self.num_agents
+                info = {"individual_rewards": rewards.squeeze(),}
+            elif self.reward_type == "saturating":
+                # Saturating rewards: only penalize agents with maximum apples
+                # Get current cumulative apple counts for all agents
+                agent_apple_counts = state.cumulative_apples_collected
+                
+                # Find the maximum apple count
+                max_apples = jnp.max(agent_apple_counts)
+                
+                # Create mask for agents with maximum apples (handle ties)
+                has_max_apples = agent_apple_counts == max_apples
+                
+                # Only agents with max apples get zero reward, all others get full reward
+                reward_multipliers = jnp.where(has_max_apples, 0.0, 1.0).reshape(-1, 1)
+                saturated_apple_rewards = base_apple_rewards * reward_multipliers
+                
+                rewards = saturated_apple_rewards * self.num_agents
+                info = {"individual_rewards": rewards.squeeze(),}
             else:
-                rewards = jnp.zeros((self.num_agents, 1))
-                rewards = jnp.where(apple_matches, 1, rewards) * self.num_agents
-                info = {}
+                raise ValueError(f"Invalid reward_type: '{self.reward_type}'. Must be 'shared', 'individual', or 'saturating'.")
             
             info["clean_action_info"] = jnp.where(actions == Actions.zap_clean, 1, 0).squeeze()
-            info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze() 
+            info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()
+            info["cumulative_apples_collected"] = state.cumulative_apples_collected.squeeze()
             
             state_nxt = State(
                 agent_locs=state.agent_locs,
@@ -1416,7 +1388,8 @@ class Clean_up(MultiAgentEnv):
                 reborn_locs=state.reborn_locs,
                 potential_dirt_and_dirt_locs=state.potential_dirt_and_dirt_locs,
                 potential_dirt_and_dirt_label=state.potential_dirt_and_dirt_label,
-                smooth_rewards=state.smooth_rewards
+                smooth_rewards=state.smooth_rewards,
+                cumulative_apples_collected=state.cumulative_apples_collected
             )
 
             # now calculate if done for inner or outer episode
@@ -1427,7 +1400,10 @@ class Clean_up(MultiAgentEnv):
             # if inner episode is done, return start state for next game
             state_re = _reset_state(key)
 
-            state_re = state_re.replace(outer_t=outer_t + 1)
+            state_re = state_re.replace(
+                outer_t=outer_t + 1, 
+                cumulative_apples_collected=state_nxt.cumulative_apples_collected
+            )
             state = jax.tree_map(
                 lambda x, y: jnp.where(reset_inner, x, y),
                 state_re,
@@ -1537,7 +1513,8 @@ class Clean_up(MultiAgentEnv):
                 reborn_locs=agent_locs,
                 potential_dirt_and_dirt_locs=potential_dirt_and_dirt,
                 potential_dirt_and_dirt_label=potential_dirt_and_dirt_label,
-                smooth_rewards=jnp.zeros((self.num_agents, 1))
+                smooth_rewards=jnp.zeros((self.num_agents, 1)),
+                cumulative_apples_collected=jnp.zeros(self.num_agents, dtype=jnp.int32)
             )
 
         def reset(
@@ -1579,10 +1556,16 @@ class Clean_up(MultiAgentEnv):
 
     def observation_space(self) -> Dict:
         """Observation space of the environment."""
+        # Base channels: (len(Items)-1) + 10, plus coefficient channel (1), plus agent ID channels if enabled
+        base_channels = (len(Items)-1) + 10
+        coef_channels = 1  # Always add coefficient channel
+        agent_id_channels = self.num_agents if self.agent_ids else 0
+        total_channels = base_channels + coef_channels + agent_id_channels
+        
         _shape_obs = (
-            (self.OBS_SIZE, self.OBS_SIZE, (len(Items)-1) + 10)
+            (self.OBS_SIZE, self.OBS_SIZE, total_channels)
             if self.cnn
-            else (self.OBS_SIZE**2 * ((len(Items)-1) + 10),)
+            else (self.OBS_SIZE**2 * total_channels,)
         )
 
         return Box(
@@ -1823,142 +1806,3 @@ class Clean_up(MultiAgentEnv):
             xmax = (i + 1) * tile_width
             img[ymin:ymax, xmin:xmax, :] = onp.int8(255)
         return img
-    
-    def get_inequity_aversion_rewards_immediate(self, array, inner_t, target_agents=None, alpha=5, beta=0.05):
-        """
-        Calculate inequity aversion rewards using immediate rewards, based on equation (3) in the paper
-        
-        Args:
-            array: shape: [num_agents, 1] immediate rewards r_i^t for each agent
-            target_agents: list of agent indices to apply inequity aversion
-            alpha: inequity aversion coefficient (when other agents' rewards are greater than self)
-            beta: inequity aversion coefficient (when self's rewards are greater than others)
-        Returns:
-            subjective_rewards: adjusted subjective rewards u_i^t after inequity aversion
-        """
-        # Ensure correct input shape
-        assert array.shape == (self.num_agents, 1), f"Expected shape ({self.num_agents}, 1), got {array.shape}"
-        
-        # Calculate inequality using immediate rewards
-        r_i = array  # [num_agents, 1]
-        r_j = jnp.transpose(array)  # [1, num_agents]
-        
-        # Calculate inequality
-        disadvantageous = jnp.maximum(r_j - r_i, 0)  # when other agents' rewards are higher
-        advantageous = jnp.maximum(r_i - r_j, 0)     # when self's rewards are higher
-        
-        # Create mask to exclude self-comparison
-        mask = 1 - jnp.eye(self.num_agents)
-        disadvantageous = disadvantageous * mask
-        advantageous = advantageous * mask
-        
-        # Calculate inequality penalty
-        n_others = self.num_agents - 1
-        inequity_penalty = (alpha * jnp.sum(disadvantageous, axis=1, keepdims=True) +
-                           beta * jnp.sum(advantageous, axis=1, keepdims=True)) / n_others
-
-        # Calculate subjective rewards u_i^t = r_i^t - inequality penalty
-        subjective_rewards = array - inequity_penalty
-
-        subjective_rewards = jnp.where(jnp.all(array == 0), -(alpha + beta) * n_others, subjective_rewards)
-        
-        # Apply inequity aversion only to target agents if specified
-        if target_agents is not None:
-            target_agents_array = jnp.array(target_agents)
-            agent_mask = jnp.zeros(self.num_agents, dtype=bool)
-            agent_mask = agent_mask.at[target_agents_array].set(True)
-            agent_mask = agent_mask.reshape(-1, 1)  # [num_agents, 1]
-            return jnp.where(agent_mask, subjective_rewards, array),jnp.sum(disadvantageous, axis=1, keepdims=True),jnp.sum(advantageous, axis=1, keepdims=True)
-        else:
-            return subjective_rewards,jnp.sum(disadvantageous, axis=1, keepdims=True),jnp.sum(advantageous, axis=1, keepdims=True)
-
-    def get_svo_rewards(self, array, w=0.5, ideal_angle_degrees=45, target_agents=None):
-        """
-        Reward shaping function based on Social Value Orientation (SVO)
-        
-        Args:
-            array: shape: [num_agents, 1] immediate rewards r_i for each agent
-            w: SVO weight to balance self-reward and social value (0 <= w <= 1)
-               w=0 means completely selfish, w=1 means completely altruistic
-            ideal_angle_degrees: ideal angle in degrees
-               - 45 degrees means complete equality
-               - 0 degrees means completely selfish
-               - 90 degrees means completely altruistic
-            target_agents: list of agent indices to apply SVO
-        
-        Returns:
-            shaped_rewards: rewards adjusted by SVO
-            theta: reward angle in radians
-        """
-        # Ensure correct input shape
-        assert array.shape == (self.num_agents, 1), f"Expected shape ({self.num_agents}, 1), got {array.shape}"
-        
-        # Convert ideal angle from degrees to radians
-        ideal_angle = (ideal_angle_degrees * jnp.pi) / 180.0
-        
-        # Calculate group average reward r_j (excluding self)
-        mask = 1 - jnp.eye(self.num_agents)  # [num_agents, num_agents]
-        # Modified: use matrix multiplication to calculate other agents' rewards
-        others_rewards = jnp.matmul(mask, array)  # [num_agents, 1]
-        mean_others = others_rewards / (self.num_agents - 1)  # divide by number of other agents
-        
-        # Calculate reward angle θ(R) = arctan(r_j / r_i)
-        r_i = array  # [num_agents, 1]
-        r_j = mean_others  # [num_agents, 1]
-        theta = jnp.arctan2(r_j, r_i)
-        
-        # Calculate social value oriented utility
-        # U(r_i, r_j) = r_i - w * |θ(R) - ideal_angle|
-        angle_deviation = jnp.abs(theta - ideal_angle)
-        svo_utility = r_i - self.num_agents * w * angle_deviation
-
-        # Apply SVO only to target agents if specified
-        if target_agents is not None:
-            target_agents_array = jnp.array(target_agents)
-            agent_mask = jnp.zeros(self.num_agents, dtype=bool)
-            agent_mask = agent_mask.at[target_agents_array].set(True)
-            agent_mask = agent_mask.reshape(-1, 1)  # [num_agents, 1]
-            return jnp.where(agent_mask, svo_utility, array), theta
-        else:
-            return svo_utility, theta
-
-    def get_standardized_svo_rewards(self, array, w=0.5, ideal_angle_degrees=45, target_agents=None):
-        """
-        Reward shaping function based on Social Value Orientation (SVO)
-        """
-        # Ensure correct input shape
-        assert array.shape == (self.num_agents, 1), f"Expected shape ({self.num_agents}, 1), got {array.shape}"
-        
-        # Convert ideal angle from degrees to radians
-        ideal_angle = (ideal_angle_degrees * jnp.pi) / 180.0
-        
-        # Calculate group average reward r_j (excluding self)
-        mask = 1 - jnp.eye(self.num_agents)
-        others_rewards = jnp.matmul(mask, array)
-        mean_others = others_rewards / (self.num_agents - 1)
-        
-        # Calculate reward angle θ(R) = arctan(r_j / r_i)
-        r_i = array
-        r_j = mean_others
-        theta = jnp.arctan2(r_j, r_i)
-        
-        # Convert angle to [0, 2π] range
-        theta = (theta + 2 * jnp.pi) % (2 * jnp.pi)
-        
-        # Calculate angle deviation and normalize to [0, 1] range
-        angle_deviation = jnp.abs(theta - ideal_angle)
-        angle_deviation = jnp.minimum(angle_deviation, 2 * jnp.pi - angle_deviation)  # take minimum deviation
-        normalized_deviation = angle_deviation / jnp.pi  # normalize to [0, 1]
-        
-        # Use multiplicative form of penalty instead of subtraction
-        svo_utility = r_i * (1 - w * normalized_deviation)
-        
-        # Apply SVO only to target agents if specified
-        if target_agents is not None:
-            target_agents_array = jnp.array(target_agents)
-            agent_mask = jnp.zeros(self.num_agents, dtype=bool)
-            agent_mask = agent_mask.at[target_agents_array].set(True)
-            agent_mask = agent_mask.reshape(-1, 1)
-            return jnp.where(agent_mask, svo_utility, array), theta
-        else:
-            return svo_utility, theta

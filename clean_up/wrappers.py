@@ -32,6 +32,8 @@ class LogEnvState:
     episode_lengths: int
     returned_episode_returns: float
     returned_episode_lengths: int
+    episode_apples: int
+    returned_episode_apples: int
 
 
 class LogWrapper(JaxMARLWrapper):
@@ -53,6 +55,8 @@ class LogWrapper(JaxMARLWrapper):
             jnp.zeros((self._env.num_agents,)),
             jnp.zeros((self._env.num_agents,)),
             jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,), dtype=jnp.int32),
+            jnp.zeros((self._env.num_agents,), dtype=jnp.int32),
         )
         return obs, state
 
@@ -69,6 +73,10 @@ class LogWrapper(JaxMARLWrapper):
         ep_done = done["__all__"]
         new_episode_return = state.episode_returns + self._batchify_floats(reward)
         new_episode_length = state.episode_lengths + 1
+        
+        # Extract cumulative apples collected from info if available
+        current_apples = info.get("cumulative_apples_collected", jnp.zeros((self._env.num_agents,), dtype=jnp.int32))
+
         state = LogEnvState(
             env_state=env_state,
             episode_returns=new_episode_return * (1 - ep_done),
@@ -77,10 +85,17 @@ class LogWrapper(JaxMARLWrapper):
             + new_episode_return * ep_done,
             returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done)
             + new_episode_length * ep_done,
+            episode_apples=current_apples * (1 - ep_done),
+            returned_episode_apples=state.returned_episode_apples * (1 - ep_done)
+            + current_apples * ep_done,
         )
+
         if self.replace_info:
             info = {}
-        info["returned_episode_returns"] = state.returned_episode_returns
-        info["returned_episode_lengths"] = state.returned_episode_lengths
+
+        info["episode_returns"] = state.returned_episode_returns
+        info["episode_lengths"] = state.returned_episode_lengths
+        info["episode_apples"] = state.returned_episode_apples
         info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
+        
         return obs, state, reward, done, info

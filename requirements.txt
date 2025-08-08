@@ -3,3 +3,4 @@ flax==0.10.6
 chex==0.1.89
 distrax
 wandb
+pillow
