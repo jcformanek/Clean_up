@@ -744,26 +744,26 @@ class Clean_up(MultiAgentEnv):
             )
 
             # Add coefficient channel showing relative apple collection
-            def add_coef_channel(grid, agent_idx):
-                # Calculate coefficient for this agent
-                agent_apple_counts = state.cumulative_apples_collected
-                max_apples = jnp.max(agent_apple_counts)
+            # def add_coef_channel(grid, agent_idx):
+            #     # Calculate coefficient for this agent
+            #     agent_apple_counts = state.cumulative_apples_collected
+            #     max_apples = jnp.max(agent_apple_counts)
                 
-                # Check if this agent has the maximum number of apples
-                has_max_apples = agent_apple_counts[agent_idx] == max_apples
+            #     # Check if this agent has the maximum number of apples
+            #     has_max_apples = agent_apple_counts[agent_idx] == max_apples
                 
-                # Coefficient: 1.0 if agent has max apples (will be penalized), 0.0 otherwise
-                coef = jnp.where(has_max_apples, 1.0, 0.0)
+            #     # Coefficient: 1.0 if agent has max apples (will be penalized), 0.0 otherwise
+            #     coef = jnp.where(has_max_apples, 1.0, 0.0)
                 
-                # Create channel filled with coefficient value (normalized to 0-255 for int8)
-                coef_channel = jnp.full((self.OBS_SIZE, self.OBS_SIZE, 1), 
-                                       jnp.round(coef * 255).astype(jnp.int8))
+            #     # Create channel filled with coefficient value (normalized to 0-255 for int8)
+            #     coef_channel = jnp.full((self.OBS_SIZE, self.OBS_SIZE, 1), 
+            #                            coef.astype(jnp.int8))
                 
-                # Concatenate with existing observation
-                return jnp.concatenate([grid, coef_channel], axis=-1)
+            #     # Concatenate with existing observation
+            #     return jnp.concatenate([grid, coef_channel], axis=-1)
 
-            # Apply coefficient channel to all agent observations
-            grids = jax.vmap(add_coef_channel, in_axes=(0, 0))(grids, jnp.arange(num_agents))
+            # # Apply coefficient channel to all agent observations
+            # grids = jax.vmap(add_coef_channel, in_axes=(0, 0))(grids, jnp.arange(num_agents))
 
             # Add agent ID channels if enabled
             if self.agent_ids:
@@ -1351,7 +1351,7 @@ class Clean_up(MultiAgentEnv):
                 }
             elif self.reward_type == "individual":
                 # Individual rewards: each agent gets only their own rewards
-                rewards = base_apple_rewards * self.num_agents
+                rewards = base_apple_rewards
                 info = {"individual_rewards": rewards.squeeze(),}
             elif self.reward_type == "saturating":
                 # Saturating rewards: only penalize agents with maximum apples
@@ -1558,7 +1558,7 @@ class Clean_up(MultiAgentEnv):
         """Observation space of the environment."""
         # Base channels: (len(Items)-1) + 10, plus coefficient channel (1), plus agent ID channels if enabled
         base_channels = (len(Items)-1) + 10
-        coef_channels = 1  # Always add coefficient channel
+        coef_channels = 0  # Always add coefficient channel
         agent_id_channels = self.num_agents if self.agent_ids else 0
         total_channels = base_channels + coef_channels + agent_id_channels
         

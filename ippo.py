@@ -20,6 +20,7 @@ import os
 from PIL import Image
 from pathlib import Path
 import orbax
+import argparse
 
 from clean_up.wrappers import LogWrapper
 from clean_up.clean_up import Clean_up
@@ -30,7 +31,7 @@ CONFIG = {
     "LR": 0.0003,
     "NUM_ENVS": 32,
     "NUM_STEPS": 1000,
-    "TOTAL_TIMESTEPS": 1e8,
+    "TOTAL_TIMESTEPS": 3e8,
     "UPDATE_EPOCHS": 2,
     "NUM_MINIBATCHES": 500,
     "GAMMA": 0.99,
@@ -42,7 +43,7 @@ CONFIG = {
     "ACTIVATION": "relu",
     "ENV_NAME": "clean_up",
     "ENV_KWARGS": {
-        "num_agents" : 5,
+        "num_agents" : 7,
         "num_inner_steps" : 1000,
         "reward_type" : "shared",  # NOTE: "shared", "individual", or "saturating"
         "cnn" : True,
@@ -55,7 +56,7 @@ CONFIG = {
     "ENTITY": "",
     "PROJECT": "socialjax",
     "WANDB_MODE" : "online",
-    "WANDB_TAGS": ["shared_reward"],
+    "WANDB_TAGS": ["shared_reward", "final"],
 }
 
 class CNN(nn.Module):
@@ -524,6 +525,8 @@ def single_run(config):
 
     print("** Evaluation Complete **")
 
+    wandb.close()
+
     return True
 
 def save_params(train_state, save_path):
@@ -600,4 +603,11 @@ def main(config):
     single_run(config)
 
 if __name__ == "__main__":
-    main(CONFIG)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seed', type=int, help='Random seed to use (overrides CONFIG)')
+    args = parser.parse_args()
+    config = CONFIG.copy()
+    if args.seed is not None:
+        config["SEED"] = args.seed
+
+    main(config)
