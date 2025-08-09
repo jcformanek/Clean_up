@@ -45,7 +45,7 @@ CONFIG = {
     "ENV_KWARGS": {
         "num_agents" : 3,
         "num_inner_steps" : 1000,
-        "reward_type" : "shared",  # NOTE: "shared", "individual", or "saturating"
+        "reward_type" : "saturating",  # NOTE: "shared", "individual", or "saturating"
         "cnn" : True,
         "jit" : True,
         "agent_ids" : True,  # NOTE: switch to True to enable agent ID channels in observations
@@ -56,7 +56,7 @@ CONFIG = {
     "ENTITY": "",
     "PROJECT": "socialjax",
     "WANDB_MODE" : "online",
-    "WANDB_TAGS": ["3-agents", "shared_reward", "small-map"],
+    "WANDB_TAGS": ["3-agents", "individual_reward", "small-map"],
 }
 
 class CNN(nn.Module):
@@ -502,10 +502,10 @@ def single_run(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
+        tags=config["WANDB_TAGS"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f'ippo_cnn_cleanup',
-        tags=config["WANDB_TAGS"]
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
@@ -524,8 +524,6 @@ def single_run(config):
     evaluate(params, Clean_up(**config["ENV_KWARGS"]), save_path, config)
 
     print("** Evaluation Complete **")
-
-    wandb.close()
 
     return True
 
