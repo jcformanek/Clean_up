@@ -22,8 +22,8 @@ from pathlib import Path
 import orbax
 import argparse
 
-from clean_up.wrappers import LogWrapper
-from clean_up.clean_up import Clean_up
+from coin_game.wrappers import LogWrapper
+from coin_game.coin_game import CoinGame
 
 CONFIG = {
     "SEED": 42,
@@ -31,7 +31,7 @@ CONFIG = {
     "LR": 0.0003,
     "NUM_ENVS": 76,
     "NUM_STEPS": 1000,
-    "TOTAL_TIMESTEPS": 1e8,
+    "TOTAL_TIMESTEPS": 1e5,
     "UPDATE_EPOCHS": 2,
     "NUM_MINIBATCHES": 500,
     "GAMMA": 0.99,
@@ -41,14 +41,14 @@ CONFIG = {
     "VF_COEF": 0.5,
     "MAX_GRAD_NORM": 0.5,
     "ACTIVATION": "relu",
-    "ENV_NAME": "clean_up",
+    "ENV_NAME": "coin_game",
     "ENV_KWARGS": {
-        "num_agents" : 3,
+        "num_agents" : 2,
         "num_inner_steps" : 1000,
-        "reward_type" : "shared",  # NOTE: "shared", "individual", or "saturating"
+        # "reward_type" : "shared",  # NOTE: "shared", "individual", or "saturating"
         "cnn" : True,
         "jit" : True,
-        "agent_ids" : True,  # NOTE: switch to True to enable agent ID channels in observations
+        # "agent_ids" : True,  # NOTE: switch to True to enable agent ID channels in observations
     },
     "ANNEAL_LR": False,
     "GIF_NUM_FRAMES": 250,
@@ -56,7 +56,7 @@ CONFIG = {
     "ENTITY": "",
     "PROJECT": "socialjax",
     "WANDB_MODE" : "online",
-    "WANDB_TAGS": ["3-agents", "shared_reward", "small-map"],
+    "WANDB_TAGS": ["2-agents", "coin-game"],
 }
 
 class CNN(nn.Module):
@@ -143,7 +143,7 @@ class Transition(NamedTuple):
 
 
 def get_rollout(params, config):
-    env = Clean_up(**config["ENV_KWARGS"])
+    env = CoinGame(**config["ENV_KWARGS"])
 
     network = ActorCritic(env.action_space().n, activation=config["ACTIVATION"])
 
@@ -219,7 +219,7 @@ def gini_coefficient(values):
 
 
 def make_train(config):
-    env = Clean_up(**config["ENV_KWARGS"])
+    env = CoinGame(**config["ENV_KWARGS"])
 
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
 
@@ -478,7 +478,6 @@ def make_train(config):
 
             metric["update_step"] = update_step
             metric["env_step"] = update_step * config["NUM_STEPS"] * config["NUM_ENVS"]
-            metric["clean_action_info"] = metric["clean_action_info"] * config["ENV_KWARGS"]["num_inner_steps"]
 
             jax.debug.callback(callback, metric)
 
@@ -504,7 +503,7 @@ def single_run(config):
         project=config["PROJECT"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'ippo_cnn_cleanup',
+        name=f'ippo_cnn_coin_game',
         tags=config["WANDB_TAGS"]
     )
 
@@ -521,11 +520,9 @@ def single_run(config):
     save_params(train_state, save_path)
     params = load_params(save_path)
 
-    evaluate(params, Clean_up(**config["ENV_KWARGS"]), save_path, config)
+    evaluate(params, CoinGame(**config["ENV_KWARGS"]), save_path, config)
 
     print("** Evaluation Complete **")
-
-    wandb.close()
 
     return True
 
@@ -551,7 +548,7 @@ def evaluate(params, env, save_path, config):
     pics = []
     img = env.render(state)
     pics.append(img)
-    root_dir = f"evaluation/cleanup"
+    root_dir = f"evaluation/coin_game"
     path = Path(root_dir + "/state_pics")
     path.mkdir(parents=True, exist_ok=True)
 
