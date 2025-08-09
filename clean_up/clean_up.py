@@ -203,31 +203,22 @@ class Clean_up(MultiAgentEnv):
         dirtSpawnProbability=0.5,
         delayStartOfDirtSpawning=50, # 50
         jit=True,
-        
         obs_size=11,
         cnn=True,
         agent_ids=False,
 
         map_ASCII = [
-                'HFFFHFFHFHFHFHFHFHFHHFHFFFHF',
-                'HFHFHFFHFHFHFHFHFHFHHFHFFFHF',
-                'HFFHFFHHFHFHFHFHFHFHHFHFFFHF',
-                'HFHFHFFHFHFHFHFHFHFHHFHFFFHF',
-                'HFFFFFFHFHFHFHFHFHFHHFHFFFHF',
-                '==============+~FHHHHHHf====',
-                '   P    P      ===+~SSf     ',
-                '     P     P   P  <~Sf  P   ',
-                '             P   P<~S>      ',
-                '   P    P         <~S>   P  ',
-                '               P  <~S>P     ',
-                '     P           P<~S>      ',
-                '           P      <~S> P    ',
-                '  P             P <~S>      ',
-                '^T^T^T^T^T^T^T^T^T;~S,^T^T^T',
-                'BBBBBBBBBBBBBBBBBBBssBBBBBBB',
-                'BBBBBBBBBBBBBBBBBBBBBBBBBBBB',
-                'BBBBBBBBBBBBBBBBBBBBBBBBBBBB',
-                'BBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+                'HFHFHFFHFHFHFH',
+                'HFFHFFHHFHFHFH',
+                'HFHFHFFHFHFHFH',
+                'HFFFFFFHFHFHFH',
+                '==============',
+                '   P    P     ',
+                '     P     P  ',
+                '^T^T^T^T^T^T^T',
+                'BBBBBBBBBBBBBB',
+                'BBBBBBBBBBBBBB',
+                'BBBBBBBBBBBBBB',
             ]
     ):
 
@@ -744,26 +735,30 @@ class Clean_up(MultiAgentEnv):
             )
 
             # Add coefficient channel showing relative apple collection
-            # def add_coef_channel(grid, agent_idx):
-            #     # Calculate coefficient for this agent
-            #     agent_apple_counts = state.cumulative_apples_collected
-            #     max_apples = jnp.max(agent_apple_counts)
-                
-            #     # Check if this agent has the maximum number of apples
-            #     has_max_apples = agent_apple_counts[agent_idx] == max_apples
-                
-            #     # Coefficient: 1.0 if agent has max apples (will be penalized), 0.0 otherwise
-            #     coef = jnp.where(has_max_apples, 1.0, 0.0)
-                
-            #     # Create channel filled with coefficient value (normalized to 0-255 for int8)
-            #     coef_channel = jnp.full((self.OBS_SIZE, self.OBS_SIZE, 1), 
-            #                            coef.astype(jnp.int8))
-                
-            #     # Concatenate with existing observation
-            #     return jnp.concatenate([grid, coef_channel], axis=-1)
+            def add_coef_channel(grid, agent_idx):
+                # Calculate coefficient for this agent
+                agent_apple_counts = state.cumulative_apples_collected
+                max_apples = jnp.max(agent_apple_counts)
 
-            # # Apply coefficient channel to all agent observations
-            # grids = jax.vmap(add_coef_channel, in_axes=(0, 0))(grids, jnp.arange(num_agents))
+                coef = jax.lax.cond(
+                    max_apples == 0,
+                    lambda _: jnp.array(1.0, dtype=jnp.float32),
+                    lambda _: 1.0 - agent_apple_counts[agent_idx] / max_apples + 0.2,
+                    operand=max_apples,
+                )
+                
+                # Create channel filled with coefficient value
+                coef_channel = jnp.full(
+                    (self.OBS_SIZE, self.OBS_SIZE, 1),
+                    coef,
+                    dtype=jnp.int8,
+                )
+                
+                # Concatenate with existing observation
+                return jnp.concatenate([grid, coef_channel], axis=-1)
+
+            # Apply coefficient channel to all agent observations
+            grids = jax.vmap(add_coef_channel, in_axes=(0, 0))(grids, jnp.arange(num_agents))
 
             # Add agent ID channels if enabled
             if self.agent_ids:
@@ -1360,15 +1355,23 @@ class Clean_up(MultiAgentEnv):
                 
                 # Find the maximum apple count
                 max_apples = jnp.max(agent_apple_counts)
+
+                coef = jax.lax.cond(
+                    max_apples == 0,
+                    lambda _: jnp.ones_like(agent_apple_counts, dtype=jnp.float32),
+                    lambda _: 1.0 - agent_apple_counts / max_apples + 0.2,
+                    operand=max_apples,
+                )
                 
-                # Create mask for agents with maximum apples (handle ties)
-                has_max_apples = agent_apple_counts == max_apples
+                # # Create mask for agents with maximum apples (handle ties)
+                # has_max_apples = agent_apple_counts == max_apples
                 
-                # Only agents with max apples get zero reward, all others get full reward
-                reward_multipliers = jnp.where(has_max_apples, 0.0, 1.0).reshape(-1, 1)
-                saturated_apple_rewards = base_apple_rewards * reward_multipliers
+                # # Only agents with max apples get zero reward, all others get full reward
+                # reward_multipliers = jnp.where(has_max_apples, 0.0, 1.0).reshape(-1, 1)
+                saturated_apple_rewards = base_apple_rewards * coef[...,jnp.newaxis]
+
                 
-                rewards = saturated_apple_rewards * self.num_agents
+                rewards = saturated_apple_rewards
                 info = {"individual_rewards": rewards.squeeze(),}
             else:
                 raise ValueError(f"Invalid reward_type: '{self.reward_type}'. Must be 'shared', 'individual', or 'saturating'.")
@@ -1558,7 +1561,7 @@ class Clean_up(MultiAgentEnv):
         """Observation space of the environment."""
         # Base channels: (len(Items)-1) + 10, plus coefficient channel (1), plus agent ID channels if enabled
         base_channels = (len(Items)-1) + 10
-        coef_channels = 0  # Always add coefficient channel
+        coef_channels = 1  # Always add coefficient channel
         agent_id_channels = self.num_agents if self.agent_ids else 0
         total_channels = base_channels + coef_channels + agent_id_channels
         
