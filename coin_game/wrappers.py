@@ -32,8 +32,10 @@ class LogEnvState:
     episode_lengths: int
     returned_episode_returns: float
     returned_episode_lengths: int
-    episode_apples: int
-    returned_episode_apples: int
+    episode_coins: int
+    returned_episode_coins: int
+    episode_team_coins: int
+    returned_episode_team_coins: int
 
 
 class LogWrapper(JaxMARLWrapper):
@@ -57,6 +59,8 @@ class LogWrapper(JaxMARLWrapper):
             jnp.zeros((self._env.num_agents,)),
             jnp.zeros((self._env.num_agents,), dtype=jnp.int32),
             jnp.zeros((self._env.num_agents,), dtype=jnp.int32),
+            jnp.zeros((self._env.num_agents,), dtype=jnp.int32),
+            jnp.zeros((self._env.num_agents,), dtype=jnp.int32),
         )
         return obs, state
 
@@ -74,8 +78,18 @@ class LogWrapper(JaxMARLWrapper):
         new_episode_return = state.episode_returns + self._batchify_floats(reward)
         new_episode_length = state.episode_lengths + 1
         
-        # Extract cumulative apples collected from info if available
-        current_apples = info.get("cumulative_apples_collected", jnp.zeros((self._env.num_agents,), dtype=jnp.int32))
+        # Extract cumulative coin information from environment info
+        # This tracks total coins collected by each agent (always increasing)
+        cumulative_own = info.get("cumulative_own_coins_collected", jnp.zeros((self._env.num_agents,), dtype=jnp.int32))
+        cumulative_other = info.get("cumulative_other_coins_collected", jnp.zeros((self._env.num_agents,), dtype=jnp.int32))
+        
+        # Calculate total cumulative coins per agent (own + other coins collected)
+        current_coins = cumulative_own + cumulative_other
+        
+        # Calculate team total coins (sum across all agents)
+        current_team_coins = jnp.sum(current_coins)
+        # Broadcast team total to all agents for consistent logging
+        current_team_coins_per_agent = jnp.full((self._env.num_agents,), current_team_coins, dtype=jnp.int32)
 
         state = LogEnvState(
             env_state=env_state,
@@ -85,9 +99,12 @@ class LogWrapper(JaxMARLWrapper):
             + new_episode_return * ep_done,
             returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done)
             + new_episode_length * ep_done,
-            episode_apples=current_apples * (1 - ep_done),
-            returned_episode_apples=state.returned_episode_apples * (1 - ep_done)
-            + current_apples * ep_done,
+            episode_coins=current_coins * (1 - ep_done),
+            returned_episode_coins=state.returned_episode_coins * (1 - ep_done)
+            + current_coins * ep_done,
+            episode_team_coins=current_team_coins_per_agent * (1 - ep_done),
+            returned_episode_team_coins=state.returned_episode_team_coins * (1 - ep_done)
+            + current_team_coins_per_agent * ep_done,
         )
 
         if self.replace_info:
@@ -95,7 +112,8 @@ class LogWrapper(JaxMARLWrapper):
 
         info["episode_returns"] = state.returned_episode_returns
         info["episode_lengths"] = state.returned_episode_lengths
-        info["episode_apples"] = state.returned_episode_apples
+        info["episode_coins"] = state.returned_episode_coins
+        info["episode_team_coins"] = state.returned_episode_team_coins
         info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
         
         return obs, state, reward, done, info

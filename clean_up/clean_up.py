@@ -1373,8 +1373,17 @@ class Clean_up(MultiAgentEnv):
                 
                 rewards = saturated_apple_rewards
                 info = {"individual_rewards": rewards.squeeze(),}
+            elif self.reward_type == "fractional":
+                # Fractional rewards: agents get individual rewards + 0.1 * team total
+                team_total_reward = jnp.sum(base_apple_rewards)
+                fractional_team_bonus = 0.1 * team_total_reward
+                
+                # Each agent gets their individual reward + fractional team bonus
+                fractional_rewards = base_apple_rewards + fractional_team_bonus
+                rewards = fractional_rewards
+                info = {"individual_rewards": base_apple_rewards.squeeze(),}
             else:
-                raise ValueError(f"Invalid reward_type: '{self.reward_type}'. Must be 'shared', 'individual', or 'saturating'.")
+                raise ValueError(f"Invalid reward_type: '{self.reward_type}'. Must be 'shared', 'individual', 'saturating', or 'fractional'.")
             
             info["clean_action_info"] = jnp.where(actions == Actions.zap_clean, 1, 0).squeeze()
             info["cleaned_water"] = jnp.array([len(state.potential_dirt_and_dirt_label) - dirtCount] * self.num_agents).squeeze()

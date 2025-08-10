@@ -31,7 +31,7 @@ CONFIG = {
     "LR": 0.0003,
     "NUM_ENVS": 76,
     "NUM_STEPS": 1000,
-    "TOTAL_TIMESTEPS": 1e5,
+    "TOTAL_TIMESTEPS": 1e7,
     "UPDATE_EPOCHS": 2,
     "NUM_MINIBATCHES": 500,
     "GAMMA": 0.99,
@@ -45,10 +45,10 @@ CONFIG = {
     "ENV_KWARGS": {
         "num_agents" : 2,
         "num_inner_steps" : 1000,
-        # "reward_type" : "shared",  # NOTE: "shared", "individual", or "saturating"
+        "reward_type" : "shared",  # NOTE: "shared", "individual", or "saturating"
         "cnn" : True,
         "jit" : True,
-        # "agent_ids" : True,  # NOTE: switch to True to enable agent ID channels in observations
+        "agent_ids" : True,  # NOTE: switch to True to enable agent ID channels in observations
     },
     "ANNEAL_LR": False,
     "GIF_NUM_FRAMES": 250,
@@ -447,29 +447,46 @@ def make_train(config):
 
             update_step = update_step + 1
 
-            # Extract per-agent apple data before averaging
-            if "episode_apples" in metric:
-                # Reshape apples to have agent dim at the end
-                episode_apples = metric["episode_apples"].reshape((config["NUM_STEPS"], config["NUM_ENVS"], config["ENV_KWARGS"]["num_agents"]))
-                
-                # Add individual agent apple metrics
-                for agent_id in range(config["ENV_KWARGS"]["num_agents"]):
-                    metric[f"agent_{agent_id}_apples"] = episode_apples[...,agent_id].mean()
-                
-                # Calculate total episode apples across all agents
-                metric["total_episode_apples"] = episode_apples.sum(axis=-1).mean()
-                
-                # Calculate Gini coefficient for apple distribution among agents
-                # Take the mean across environments for each agent, then compute Gini across agents
-                agent_apple_means = jnp.array([episode_apples[...,agent_id].mean() for agent_id in range(config["ENV_KWARGS"]["num_agents"])])
-                metric["apple_gini_coefficient"] = gini_coefficient(agent_apple_means)
-                
-                # Remove the original episode_apples from metrics
-                del metric["episode_apples"]
+
             
-            # Remove cumulative_apples_collected if it exists
-            if "cumulative_apples_collected" in metric:
-                del metric["cumulative_apples_collected"]
+            # Extract per-agent coin data before averaging
+            if "episode_coins" in metric:
+                # Reshape coins to have agent dim at the end
+                episode_coins = metric["episode_coins"].reshape((config["NUM_STEPS"], config["NUM_ENVS"], config["ENV_KWARGS"]["num_agents"]))
+                
+                # Add individual agent coin metrics
+                for agent_id in range(config["ENV_KWARGS"]["num_agents"]):
+                    metric[f"agent_{agent_id}_coins"] = episode_coins[...,agent_id].mean()
+                
+                # Calculate total episode coins across all agents
+                metric["total_episode_coins"] = episode_coins.sum(axis=-1).mean()
+                
+                # Calculate Gini coefficient for coin distribution among agents
+                # Take the mean across environments for each agent, then compute Gini across agents
+                agent_coin_means = jnp.array([episode_coins[...,agent_id].mean() for agent_id in range(config["ENV_KWARGS"]["num_agents"])])
+                metric["coin_gini_coefficient"] = gini_coefficient(agent_coin_means)
+                
+                # Remove the original episode_coins from metrics
+                del metric["episode_coins"]
+            
+            # Extract team coin data before averaging
+            if "episode_team_coins" in metric:
+                # Reshape team coins to have agent dim at the end
+                episode_team_coins = metric["episode_team_coins"].reshape((config["NUM_STEPS"], config["NUM_ENVS"], config["ENV_KWARGS"]["num_agents"]))
+                
+                # Since all agents have the same team coin value, just take the first agent's value
+                metric["team_total_coins"] = episode_team_coins[...,0].mean()
+                
+                # Remove the original episode_team_coins from metrics
+                del metric["episode_team_coins"]
+            
+            # Remove other coin-related metrics that shouldn't be averaged
+            if "cumulative_own_coins_collected" in metric:
+                del metric["cumulative_own_coins_collected"]
+            if "cumulative_other_coins_collected" in metric:
+                del metric["cumulative_other_coins_collected"]
+            if "agent_inventories" in metric:
+                del metric["agent_inventories"]
             
             metric = jax.tree_map(lambda x: x.mean(), metric)
 

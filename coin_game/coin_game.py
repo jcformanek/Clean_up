@@ -35,11 +35,12 @@ class State:
     inner_t: int
     outer_t: int
     grid: jnp.ndarray
-    apples: jnp.ndarray
 
     freeze: jnp.ndarray
     reborn_locs: jnp.ndarray
     smooth_rewards: jnp.ndarray
+    cumulative_own_coins_collected: jnp.ndarray
+    cumulative_other_coins_collected: jnp.ndarray
 
 @chex.dataclass
 class EnvParams:
@@ -60,8 +61,8 @@ class Items(IntEnum):
     empty = 0
     wall = 1
     interact = 2
-    red_apple = 3
-    green_apple = 4
+    red_coin = 3
+    green_coin = 4
 
     
 char_to_int = {
@@ -157,7 +158,7 @@ class CoinGame(MultiAgentEnv):
         num_inner_steps=1000,
         num_outer_steps=1,
         num_agents=2,
-        shared_rewards=True,
+        reward_type="individual",  # "shared", "individual", or "saturating"
         payoff_matrix=[[1, 1, -2], [1, 1, -2]],
         regrow_rate=0.0005,
         inequity_aversion=False,
@@ -174,11 +175,10 @@ class CoinGame(MultiAgentEnv):
         grid_size=(16,11),
         obs_size=11,
         cnn=True,
+        agent_ids=False,
         map_ASCII = [
                 "CCCCCCCCCCC",
                 "CPCCCCCCCCC",
-                "CCCCCCCCCCC",
-                "CCCCCCCCCCC",
                 "CCCCCCCCCCC",
                 "CCCCCCCCCCC",
                 "CCCCCCCCCCC",
@@ -197,10 +197,12 @@ class CoinGame(MultiAgentEnv):
         self.num_outer_steps = num_outer_steps
 
         # self.agents = [str(i) for i in list(range(num_agents))]
-
+        
+        self.reward_type = reward_type
         self.payoff_matrix = payoff_matrix
-        self.shared_rewards = shared_rewards
+        self.shared_rewards = self.reward_type == "shared"  # For backward compatibility
         self.cnn = cnn
+        self.agent_ids = agent_ids
         self.inequity_aversion = inequity_aversion
         self.inequity_aversion_target_agents = inequity_aversion_target_agents
         self.inequity_aversion_alpha = inequity_aversion_alpha
@@ -234,7 +236,7 @@ class CoinGame(MultiAgentEnv):
             return a_positions
 
         nums_map = ascii_map_to_matrix(map_ASCII, char_to_int)
-        self.SPAWNS_APPLE = find_positions(nums_map, 3)
+        self.SPAWNS_COINS = find_positions(nums_map, 3)
         self.SPAWNS_PLAYERS = find_positions(nums_map, 4)
 
 
@@ -715,6 +717,59 @@ class CoinGame(MultiAgentEnv):
                 state
             )
 
+            # Add coefficient channel showing relative coin collection
+            def add_coef_channel(grid, agent_idx):
+                # Calculate coefficient for this agent based on coin collection behavior
+                own_coins = state.cumulative_own_coins_collected[agent_idx]
+                other_coins = state.cumulative_other_coins_collected[agent_idx]
+                
+                # Total coins collected across all agents (for normalization)
+                total_own_coins_all = jnp.sum(state.cumulative_own_coins_collected)
+                total_other_coins_all = jnp.sum(state.cumulative_other_coins_collected)
+                total_coins_all = total_own_coins_all + total_other_coins_all
+                
+                # Calculate a cooperation coefficient:
+                # - Higher value for agents who collect more of their own coins relative to others' coins
+                # - Lower value for agents who collect more of others' coins
+                coef = jax.lax.cond(
+                    total_coins_all == 0,
+                    lambda _: jnp.array(1.0, dtype=jnp.float32),
+                    lambda _: jax.lax.cond(
+                        (own_coins + other_coins) == 0,
+                        lambda _: jnp.array(1.0, dtype=jnp.float32),
+                        lambda _: (own_coins / (own_coins + other_coins + 1e-8)) * 0.8 + 0.2,
+                        operand=None
+                    ),
+                    operand=None,
+                )
+                
+                # Create channel filled with coefficient value
+                coef_channel = jnp.full(
+                    (self.OBS_SIZE, self.OBS_SIZE, 1),
+                    coef,
+                    dtype=jnp.int8,
+                )
+                
+                # Concatenate with existing observation
+                return jnp.concatenate([grid, coef_channel], axis=-1)
+
+            # Apply coefficient channel to all agent observations
+            grids = jax.vmap(add_coef_channel, in_axes=(0, 0))(grids, jnp.arange(num_agents))
+
+            # Add agent ID channels if enabled
+            if self.agent_ids:
+                # Create agent ID channels for each agent
+                def add_agent_id_channels(grid, agent_idx):
+                    # Create num_agents channels, all zeros
+                    agent_id_channels = jnp.zeros((self.OBS_SIZE, self.OBS_SIZE, num_agents), dtype=jnp.int8)
+                    # Set the channel corresponding to this agent's ID to all ones
+                    agent_id_channels = agent_id_channels.at[:, :, agent_idx].set(1)
+                    # Concatenate with existing observation
+                    return jnp.concatenate([grid, agent_id_channels], axis=-1)
+
+                # Apply agent ID channels to all agent observations
+                grids = jax.vmap(add_agent_id_channels, in_axes=(0, 0))(grids, self._agents - len(Items))
+
             return grids
 
 
@@ -734,30 +789,30 @@ class CoinGame(MultiAgentEnv):
             #     actions
             # )
             key, subkey = jax.random.split(key)
-            # regrow apple
-            grid_apple = state.grid
+            # regrow coins
+            grid_coins = state.grid
             probability = self.regrow_rate
-            def regrow_green_apple(apple_locs, p):
-                new_apple = jnp.where((((grid_apple[apple_locs[0], apple_locs[1]] == Items.empty) & (p < probability)) 
-                                       | ((grid_apple[apple_locs[0], apple_locs[1]] == Items.green_apple))),  
-                                      Items.green_apple, grid_apple[apple_locs[0], apple_locs[1]])
-                return new_apple
-            prob = jax.random.uniform(key, shape=(len(self.SPAWNS_APPLE),))
-            new_apple = jax.vmap(regrow_green_apple)(self.SPAWNS_APPLE, prob)
-            new_apple_grid = grid_apple.at[self.SPAWNS_APPLE[:, 0], self.SPAWNS_APPLE[:, 1]].set(new_apple[:])
-            state = state.replace(grid=new_apple_grid)
+            def regrow_green_coin(coin_locs, p):
+                new_coin = jnp.where((((grid_coins[coin_locs[0], coin_locs[1]] == Items.empty) & (p < probability)) 
+                                       | ((grid_coins[coin_locs[0], coin_locs[1]] == Items.green_coin))),  
+                                      Items.green_coin, grid_coins[coin_locs[0], coin_locs[1]])
+                return new_coin
+            prob = jax.random.uniform(key, shape=(len(self.SPAWNS_COINS),))
+            new_coin = jax.vmap(regrow_green_coin)(self.SPAWNS_COINS, prob)
+            new_coin_grid = grid_coins.at[self.SPAWNS_COINS[:, 0], self.SPAWNS_COINS[:, 1]].set(new_coin[:])
+            state = state.replace(grid=new_coin_grid)
 
 
-            grid_apple = state.grid
-            def regrow_red_apple(apple_locs, p):
-                new_apple = jnp.where((((grid_apple[apple_locs[0], apple_locs[1]] == Items.empty) & (p < probability)) 
-                                       | ((grid_apple[apple_locs[0], apple_locs[1]] == Items.red_apple))),  
-                                      Items.red_apple, grid_apple[apple_locs[0], apple_locs[1]])
-                return new_apple
-            prob = jax.random.uniform(subkey, shape=(len(self.SPAWNS_APPLE),))
-            new_apple = jax.vmap(regrow_red_apple)(self.SPAWNS_APPLE, prob)
-            new_apple_grid = grid_apple.at[self.SPAWNS_APPLE[:, 0], self.SPAWNS_APPLE[:, 1]].set(new_apple[:])
-            state = state.replace(grid=new_apple_grid)
+            grid_coins = state.grid
+            def regrow_red_coin(coin_locs, p):
+                new_coin = jnp.where((((grid_coins[coin_locs[0], coin_locs[1]] == Items.empty) & (p < probability)) 
+                                       | ((grid_coins[coin_locs[0], coin_locs[1]] == Items.red_coin))),  
+                                      Items.red_coin, grid_coins[coin_locs[0], coin_locs[1]])
+                return new_coin
+            prob = jax.random.uniform(subkey, shape=(len(self.SPAWNS_COINS),))
+            new_coin = jax.vmap(regrow_red_coin)(self.SPAWNS_COINS, prob)
+            new_coin_grid = grid_coins.at[self.SPAWNS_COINS[:, 0], self.SPAWNS_COINS[:, 1]].set(new_coin[:])
+            state = state.replace(grid=new_coin_grid)
 
 
             key, subkey = jax.random.split(key)
@@ -813,21 +868,21 @@ class CoinGame(MultiAgentEnv):
             )
 
             # update inventories
-            def red_matcher(p: jnp.ndarray) -> jnp.ndarray:
+            def red_coin_matcher(p: jnp.ndarray) -> jnp.ndarray:
                 c_matches = jnp.array([
-                    state.grid[p[0], p[1]] == Items.red_apple
+                    state.grid[p[0], p[1]] == Items.red_coin
                     ])
                 return c_matches
             
-            def green_matcher(p: jnp.ndarray) -> jnp.ndarray:
+            def green_coin_matcher(p: jnp.ndarray) -> jnp.ndarray:
                 c_matches = jnp.array([
-                    state.grid[p[0], p[1]] == Items.green_apple
+                    state.grid[p[0], p[1]] == Items.green_coin
                     ])
                 return c_matches
 
 
-            red_apple_matches = jax.vmap(red_matcher)(p=new_locs)
-            green_apple_matches = jax.vmap(green_matcher)(p=new_locs)
+            red_coin_matches = jax.vmap(red_coin_matcher)(p=new_locs)
+            green_coin_matches = jax.vmap(green_coin_matcher)(p=new_locs)
 
 
             red_red_reward = self.payoff_matrix[0][0]
@@ -839,21 +894,61 @@ class CoinGame(MultiAgentEnv):
 
             red_reward, green_reward = 0, 0
 
-            red_red_matches = red_apple_matches[0, :]
-            red_green_matches = green_apple_matches[0, :]
+            red_red_matches = red_coin_matches[0, :]
+            red_green_matches = green_coin_matches[0, :]
             
             # jnp.all(
             #     new_red_pos == state.blue_coin_pos, axis=-1
             # )
 
-            green_red_matches = red_apple_matches[1, :]
+            green_red_matches = red_coin_matches[1, :]
             # jnp.all(
             #     new_blue_pos == state.red_coin_pos, axis=-1
             # )
-            green_green_matches = green_apple_matches[1, :]
+            green_green_matches = green_coin_matches[1, :]
             # jnp.all(
             #     new_blue_pos == state.blue_coin_pos, axis=-1
             # )
+
+            # Update agent inventories and cumulative tracking
+            # Agent 0 (red) collecting own coins (red coins)
+            red_own_coins = jnp.where(red_red_matches, 1, 0)
+            # Agent 0 (red) collecting other agent's coins (green coins)  
+            red_other_coins = jnp.where(red_green_matches, 1, 0)
+            # Agent 1 (green) collecting own coins (green coins)
+            green_own_coins = jnp.where(green_green_matches, 1, 0)
+            # Agent 1 (green) collecting other agent's coins (red coins)
+            green_other_coins = jnp.where(green_red_matches, 1, 0)
+
+            # Update agent inventories
+            # Each agent gains coins when they collect their own coins
+            # Each agent loses coins when others collect their coins (but can't go below 0)
+            inventory_changes = jnp.zeros((self.num_agents, 2), dtype=jnp.int8)
+            
+            # Agent 0 gains when collecting own red coins
+            inventory_changes = inventory_changes.at[0, 0].add(red_own_coins[0])
+            # Agent 1 gains when collecting own green coins  
+            inventory_changes = inventory_changes.at[1, 1].add(green_own_coins[0])
+            
+            # Agent 0 loses when Agent 1 collects red coins (Agent 0's coins)
+            agent_0_loss = jnp.minimum(green_other_coins[0], state.agent_invs[0, 0])  # Can't lose more than they have
+            inventory_changes = inventory_changes.at[0, 0].add(-agent_0_loss)
+            
+            # Agent 1 loses when Agent 0 collects green coins (Agent 1's coins)
+            agent_1_loss = jnp.minimum(red_other_coins[0], state.agent_invs[1, 1])  # Can't lose more than they have
+            inventory_changes = inventory_changes.at[1, 1].add(-agent_1_loss)
+            
+            # Update inventories (ensure no negative values)
+            new_invs = jnp.maximum(state.agent_invs + inventory_changes, 0)
+
+            # Update cumulative tracking (only count actual coins gained/lost, not attempted)
+            own_coins_collected = jnp.array([red_own_coins[0], green_own_coins[0]], dtype=jnp.int32)
+            # For other coins, only count what was actually taken (limited by available inventory)
+            other_coins_actually_taken = jnp.array([red_other_coins[0] * jnp.where(agent_1_loss > 0, 1, 0), 
+                                                   green_other_coins[0] * jnp.where(agent_0_loss > 0, 1, 0)], dtype=jnp.int32)
+
+            new_cumulative_own = state.cumulative_own_coins_collected + own_coins_collected
+            new_cumulative_other = state.cumulative_other_coins_collected + other_coins_actually_taken
 
             red_reward = jnp.where(
                 red_red_matches, red_reward + red_red_reward, red_reward
@@ -861,8 +956,9 @@ class CoinGame(MultiAgentEnv):
             red_reward = jnp.where(
                 red_green_matches, red_reward + red_green_reward, red_reward
             )
+            # Only apply penalty if coins were actually taken (agent had coins to lose)
             red_reward = jnp.where(
-                green_red_matches, red_reward + red_penalty, red_reward
+                jnp.logical_and(green_red_matches, agent_0_loss > 0), red_reward + red_penalty, red_reward
             )
 
             green_reward = jnp.where(
@@ -871,27 +967,10 @@ class CoinGame(MultiAgentEnv):
             green_reward = jnp.where(
                 green_green_matches, green_reward + green_green_reward, green_reward
             )
+            # Only apply penalty if coins were actually taken (agent had coins to lose)
             green_reward = jnp.where(
-                red_green_matches, green_reward + green_penalty, green_reward
+                jnp.logical_and(red_green_matches, agent_1_loss > 0), green_reward + green_penalty, green_reward
             )
-
-            rewards = jnp.zeros((2, 1))
-
-            rewards = rewards.at[0, 0].set(red_reward[0])
-            rewards = rewards.at[1, 0].set(green_reward[0])
-
-            # # single reward or sum reward
-
-            # rewards_sum_all_agents = jnp.zeros((self.num_agents, 1))
-            # rewards_sum = jnp.sum(rewards)
-            # rewards_sum_all_agents += rewards_sum
-            # rewards = rewards_sum_all_agents
-
-            # # new_invs = state.agent_invs + apple_matches
-
-            # # state = state.replace(
-            # #     agent_invs=new_invs
-            # # )
 
             # update grid
             old_grid = state.grid
@@ -909,57 +988,47 @@ class CoinGame(MultiAgentEnv):
             # update agent locations
             state = state.replace(agent_locs=new_locs)
 
-
-            if self.shared_rewards:
-                rewards = jnp.zeros((2, 1))
-                rewards = rewards.at[0, 0].set(red_reward[0])
-                rewards = rewards.at[1, 0].set(green_reward[0])
-                rewards_sum = jnp.sum(rewards)
+            # Calculate base rewards (includes penalties for having coins stolen)
+            base_rewards = jnp.zeros((self.num_agents, 1))
+            base_rewards = base_rewards.at[0, 0].set(red_reward[0])
+            base_rewards = base_rewards.at[1, 0].set(green_reward[0])
+            
+            # Apply reward type logic
+            if self.reward_type == "shared":
+                # Shared rewards: all agents get sum of all rewards
+                rewards_sum = jnp.sum(base_rewards)
                 rewards_sum_all_agents = jnp.zeros((self.num_agents, 1))
                 rewards_sum_all_agents += rewards_sum
                 rewards = rewards_sum_all_agents
                 info = {
-                    "original_rewards": rewards.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
+                    "individual_rewards": base_rewards.squeeze(),
                 }
-            elif self.inequity_aversion:
-                rewards = jnp.zeros((2, 1))
-                rewards = rewards.at[0, 0].set(red_reward[0])
-                rewards = rewards.at[1, 0].set(green_reward[0])
-                original_rewards = rewards * self.num_agents
-                if self.smooth_rewards:
-                    should_smooth = (state.inner_t % 1) == 0
-                    new_smooth_rewards = 0.99 * 0.01* state.smooth_rewards + original_rewards
-                    rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(new_smooth_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
-                    state = state.replace(smooth_rewards=new_smooth_rewards)
-                    info = {
-                    "original_rewards": rewards.squeeze(),
-                    "smooth_rewards": state.smooth_rewards.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
-                }
-                else:
-                    rewards,disadvantageous,advantageous = self.get_inequity_aversion_rewards_immediate(original_rewards, self.inequity_aversion_target_agents, state.inner_t, self.inequity_aversion_alpha, self.inequity_aversion_beta)
-                    info = {
-                    "original_rewards": rewards.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
-                }
-            elif self.svo:
-                rewards = jnp.zeros((2, 1))
-                rewards = rewards.at[0, 0].set(red_reward[0])
-                rewards = rewards.at[1, 0].set(green_reward[0])
-                rewards = rewards * self.num_agents
-                rewards, theta = self.get_svo_rewards(rewards, self.svo_w, self.svo_ideal_angle_degrees, self.svo_target_agents)
-                info = {
-                    "original_rewards": rewards.squeeze(),
-                    "svo_theta": theta.squeeze(),
-                    "shaped_rewards": rewards.squeeze(),
-                }
+            elif self.reward_type == "individual":
+                # Individual rewards: each agent gets only their own rewards
+                rewards = base_rewards * self.num_agents
+                info = {"individual_rewards": rewards.squeeze(),}
+            elif self.reward_type == "saturating":
+                # Saturating rewards: penalize agents with more total coins collected
+                # Calculate total coins collected by each agent (own + other)
+                total_coins_collected = new_cumulative_own + new_cumulative_other
+                
+                # Find the maximum total coin count
+                max_coins = jnp.max(total_coins_collected)
+
+                coef = jax.lax.cond(
+                    max_coins == 0,
+                    lambda _: jnp.ones_like(total_coins_collected, dtype=jnp.float32),
+                    lambda _: 1.0 - total_coins_collected / max_coins + 0.2,
+                    operand=max_coins,
+                )
+                
+                # Apply coefficient to scale down rewards for agents with more coins
+                saturated_rewards = base_rewards * coef[..., jnp.newaxis]
+                
+                rewards = saturated_rewards * self.num_agents
+                info = {"individual_rewards": rewards.squeeze(),}
             else:
-                rewards = jnp.zeros((2, 1))
-                rewards = rewards.at[0, 0].set(red_reward[0])
-                rewards = rewards.at[1, 0].set(green_reward[0])
-                rewards = rewards * self.num_agents
-                info = {}
+                raise ValueError(f"Invalid reward_type: '{self.reward_type}'. Must be 'shared', 'individual', or 'saturating'.")
             
             eat_own_coins = jnp.zeros((2, 1))
             red_reward, green_reward = 0, 0
@@ -974,6 +1043,8 @@ class CoinGame(MultiAgentEnv):
             eat_own_coins = eat_own_coins.at[0, 0].set(red_reward[0])
             eat_own_coins = eat_own_coins.at[1, 0].set(green_reward[0])
             info["eat_own_coins"] = eat_own_coins.squeeze() * self.num_agents
+            info["cumulative_own_coins_collected"] = new_cumulative_own.squeeze()
+            info["cumulative_other_coins_collected"] = new_cumulative_other.squeeze()
 
             # if self.shared_rewards:
             #     rewards = jnp.zeros((2, 1))
@@ -992,14 +1063,15 @@ class CoinGame(MultiAgentEnv):
 
             state_nxt = State(
                 agent_locs=state.agent_locs,
-                agent_invs=state.agent_invs,
+                agent_invs=new_invs,
                 inner_t=state.inner_t + 1,
                 outer_t=state.outer_t,
                 grid=state.grid,
-                apples=state.apples,
                 freeze=state.freeze,
                 reborn_locs=state.reborn_locs,
-                smooth_rewards=state.smooth_rewards
+                smooth_rewards=state.smooth_rewards,
+                cumulative_own_coins_collected=new_cumulative_own,
+                cumulative_other_coins_collected=new_cumulative_other
             )
 
             # now calculate if done for inner or outer episode
@@ -1010,7 +1082,11 @@ class CoinGame(MultiAgentEnv):
             # if inner episode is done, return start state for next game
             state_re = _reset_state(key)
 
-            state_re = state_re.replace(outer_t=outer_t + 1)
+            state_re = state_re.replace(
+                outer_t=outer_t + 1,
+                cumulative_own_coins_collected=state_nxt.cumulative_own_coins_collected,
+                cumulative_other_coins_collected=state_nxt.cumulative_other_coins_collected
+            )
             state = jax.tree_map(
                 lambda x, y: jnp.where(reset_inner, x, y),
                 state_re,
@@ -1048,7 +1124,7 @@ class CoinGame(MultiAgentEnv):
 
             agent_pos = jax.random.permutation(subkey, self.SPAWNS_PLAYERS)
 
-            apple_pos = self.SPAWNS_APPLE
+            coin_pos = self.SPAWNS_COINS
 
             player_dir = jax.random.randint(
                 subkey, shape=(
@@ -1077,11 +1153,12 @@ class CoinGame(MultiAgentEnv):
                 inner_t=0,
                 outer_t=0,
                 grid=grid,
-                apples=apple_pos,
 
                 freeze=freeze,
                 reborn_locs = agent_locs,
-                smooth_rewards=jnp.zeros((self.num_agents, 1))
+                smooth_rewards=jnp.zeros((self.num_agents, 1)),
+                cumulative_own_coins_collected=jnp.zeros(self.num_agents, dtype=jnp.int32),
+                cumulative_other_coins_collected=jnp.zeros(self.num_agents, dtype=jnp.int32)
             )
 
         def reset(
@@ -1122,10 +1199,16 @@ class CoinGame(MultiAgentEnv):
 
     def observation_space(self) -> Dict:
         """Observation space of the environment."""
+        # Base channels: (len(Items)-1) + 10, plus coefficient channel (1), plus agent ID channels if enabled
+        base_channels = (len(Items)-1) + 10
+        coef_channels = 1  # Always add coefficient channel
+        agent_id_channels = self.num_agents if self.agent_ids else 0
+        total_channels = base_channels + coef_channels + agent_id_channels
+        
         _shape_obs = (
-            (self.OBS_SIZE, self.OBS_SIZE, (len(Items)-1) + 10)
+            (self.OBS_SIZE, self.OBS_SIZE, total_channels)
             if self.cnn
-            else (self.OBS_SIZE**2 * ((len(Items)-1) + 10),)
+            else (self.OBS_SIZE**2 * total_channels,)
         )
 
         return Box(
@@ -1173,13 +1256,13 @@ class CoinGame(MultiAgentEnv):
         if obj in self._agents:
             # Draw the agent
             agent_color = self.PLAYER_COLOURS[obj-len(Items)]
-        elif obj == Items.red_apple:
-            # Draw the red coin as GREEN COOPERATE
+        elif obj == Items.red_coin:
+            # Draw the red coin
             fill_coords(
                 img, point_in_circle(0.5, 0.5, 0.31), (214.0, 39.0, 40.0)
             )
-        elif obj == Items.green_apple:
-            # Draw the blue coin as DEFECT/ RED COIN
+        elif obj == Items.green_coin:
+            # Draw the green coin
             fill_coords(
                 img, point_in_circle(0.5, 0.5, 0.31), (39.0, 214.0, 40.0)
             )

@@ -45,7 +45,7 @@ CONFIG = {
     "ENV_KWARGS": {
         "num_agents" : 3,
         "num_inner_steps" : 1000,
-        "reward_type" : "saturating",  # NOTE: "shared", "individual", or "saturating"
+        "reward_type" : "fractional",  # NOTE: "shared", "individual", or "saturating"
         "cnn" : True,
         "jit" : True,
         "agent_ids" : True,  # NOTE: switch to True to enable agent ID channels in observations
