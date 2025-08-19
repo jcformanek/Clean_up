@@ -374,7 +374,7 @@ class Clean_up(MultiAgentEnv):
                 # values
                 rand_index = jax.random.randint(
                     key,
-                    (1,),
+                    (),
                     0,
                     true_count
                 )
@@ -407,7 +407,7 @@ class Clean_up(MultiAgentEnv):
             # Prepare random agent selection
             k1, k2 = jax.random.split(key, 2)
             rand_idx = select_random_true_index(k1, collisions)
-            collisions_rand = collisions.at[rand_idx].set(False) # <<<< PROBLEM LINE        
+            collisions_rand = collisions.at[rand_idx].set(False)
             new_locs_rand = jax.vmap(
                 lambda p, l, n: jnp.where(p, l, n)
             )(
@@ -482,22 +482,22 @@ class Clean_up(MultiAgentEnv):
                 # check if agent is frozen and can observe inventories
                 show_inv_bool = jnp.logical_and(
                         state.freeze[
-                            agent-len(Items)
+                            agent - len(Items)
                         ].max(axis=-1) > 0,
                         item_idx >= len(Items)
                 )
 
-                show_inv_idxs = jnp.where(
-                    state.freeze[agent],
-                    size=12, # since, in a setting where simultaneous interac-
-                    fill_value=-1 # -tions can happen, only a max of 12 can
-                )[0] # happen at once (zap logic), regardless of pop size
+                show_inv_idxs = jnp.nonzero(
+                    state.freeze[agent - len(Items)],
+                    size=12,
+                    fill_value=-1
+                )[0]
 
                 inv_to_show = jnp.where(
                     jnp.logical_or(
                         jnp.logical_and(
                             show_inv_bool,
-                            jnp.isin(item_idx-len(Items), show_inv_idxs),
+                            jnp.any((item_idx - len(Items)) == show_inv_idxs),
                         ),
                         agent_element
                     ),
@@ -561,74 +561,40 @@ class Clean_up(MultiAgentEnv):
                 grid: jnp.ndarray
             ) -> jnp.ndarray:
             '''
-            Check's relative orientations of all other agents in view of
-            current agent.
-            
-            Args:
-                - agent: int, an index indicating current agent number
-                - agent_locs: jax ndarray of agent locations (x, y, direction)
-                - grid: jax ndarray of current agent's obs grid
-                
-            Returns:
-                - grid with 1) int -1 in places where no agent exists, or
-                where the agent is the current agent, and 2) int in range
-                0-3 in cells of opposing agents indicating relative
-                orientation to current agent.
+            Compute relative orientations of other agents visible to the current agent.
+            Returns -1 where no other agent is present.
             '''
-            # we decrement by num of Items when indexing as we incremented by
-            # 5 in constructor call (due to 5 non-agent Items enum & locations
-            # are indexed from 0)
             idx = agent - len(Items)
-            agents = jnp.delete(
-                self._agents,
-                idx,
-                assume_unique_indices=True
-            )
             curr_agent_dir = agent_locs[idx, 2]
 
-            def calc_relative_direction(cell):
-                cell_agent = cell - len(Items)
-                cell_direction = agent_locs[cell_agent, 2]
-                return (cell_direction - curr_agent_dir) % 4
+            first_agent_id = len(Items)
+            last_agent_id = len(Items) + self.num_agents - 1
 
-            angle = jnp.where(
-                jnp.isin(grid, agents),
-                jax.vmap(calc_relative_direction)(grid),
-                -1
-            )
+            mask = (grid >= first_agent_id) & (grid <= last_agent_id) & (grid != agent)
+
+            # Safe gather: map cell id -> agent index [0, num_agents-1]
+            agent_index = jnp.clip(grid - len(Items), 0, self.num_agents - 1).astype(jnp.int32)
+            cell_direction = agent_locs[agent_index, 2]
+
+            rel_dir = (cell_direction - curr_agent_dir) % 4
+            angle = jnp.where(mask, rel_dir, -1)
 
             return angle
         
         def rotate_grid(agent_loc: jnp.ndarray, grid: jnp.ndarray) -> jnp.ndarray:
             '''
-            Rotates agent's observation grid k * 90 degrees, depending on agent's
-            orientation.
-
-            Args:
-                - agent_loc: jax ndarray of agent's x, y, direction
-                - grid: jax ndarray of agent's obs grid
-
-            Returns:
-                - jnp.ndarray of new rotated grid.
-
+            Rotates agent's observation grid by 0/90/180/270 degrees based on direction.
+            Uses a data-dependent branch to avoid computing all rotations.
             '''
-            grid = jnp.where(
-                agent_loc[2] == 1,
-                jnp.rot90(grid, k=1, axes=(0, 1)),
-                grid,
-            )
-            grid = jnp.where(
-                agent_loc[2] == 2,
-                jnp.rot90(grid, k=2, axes=(0, 1)),
-                grid,
-            )
-            grid = jnp.where(
-                agent_loc[2] == 3,
-                jnp.rot90(grid, k=3, axes=(0, 1)),
-                grid,
-            )
-
-            return grid
+            def rot0(g):
+                return g
+            def rot1(g):
+                return jnp.rot90(g, k=1, axes=(0, 1))
+            def rot2(g):
+                return jnp.rot90(g, k=2, axes=(0, 1))
+            def rot3(g):
+                return jnp.rot90(g, k=3, axes=(0, 1))
+            return jax.lax.switch(jnp.asarray(agent_loc[2], jnp.int32), [rot0, rot1, rot2, rot3], grid)
 
         def _get_obs_point(agent_loc: jnp.ndarray) -> jnp.ndarray:
             '''
@@ -742,8 +708,8 @@ class Clean_up(MultiAgentEnv):
 
                 coef = jax.lax.cond(
                     max_apples == 0,
-                    lambda _: jnp.array(1.0, dtype=jnp.float32),
-                    lambda _: 1.0 - agent_apple_counts[agent_idx] / max_apples + 0.2,
+                    lambda _: jnp.array(1.0, dtype=jnp.bfloat16),
+                    lambda _: jnp.asarray(1.0, dtype=jnp.bfloat16) - jnp.asarray(agent_apple_counts[agent_idx], dtype=jnp.bfloat16) / jnp.asarray(max_apples, dtype=jnp.bfloat16) + jnp.asarray(0.2, dtype=jnp.bfloat16),
                     operand=max_apples,
                 )
                 
@@ -793,165 +759,144 @@ class Clean_up(MultiAgentEnv):
                 and index 3 is the new freeze penalty matrix.
             '''
             # if interact
-            zaps = jnp.isin(actions,
-                jnp.array(
-                    [
-                        Actions.zap_forward,
-                        # Actions.zap_ahead
-                    ]
-                )
-            )
+            zaps = actions == Actions.zap_forward
 
             interact_idx = jnp.int16(Items.interact)
 
-            # remove old interacts
+            # Always clear last-step beams so they are single-frame
             state = state.replace(grid=jnp.where(
                 state.grid == interact_idx, jnp.int16(Items.empty), state.grid
             ))
-
             state = state.replace(grid=jnp.where(
                 state.grid == Items.clean_beam, jnp.int16(Items.empty), state.grid
             ))
+            any_zap = jnp.any(zaps)
 
             # calculate pickups
             # agent_pickups = state.agent_invs.sum(axis=-1) > -100
+            def zap_branch(st: State):
+                one_step_targets = jax.vmap(
+                    lambda p: p + STEP[p[2]]
+                )(st.agent_locs)
 
-            one_step_targets = jax.vmap(
-                lambda p: p + STEP[p[2]]
-            )(state.agent_locs)
+                two_step_targets = jax.vmap(
+                    lambda p: p + 2 * STEP[p[2]]
+                )(st.agent_locs)
 
-            # check 2 ahead
-            two_step_targets = jax.vmap(
-                lambda p: p + 2*STEP[p[2]]
-            )(state.agent_locs)
+                target_right = jax.vmap(
+                    lambda p: p + STEP[p[2]] + STEP[(p[2] + 1) % 4]
+                )(st.agent_locs)
 
+                target_left = jax.vmap(
+                    lambda p: p + STEP[p[2]] + STEP[(p[2] - 1) % 4]
+                )(st.agent_locs)
 
-            target_right = jax.vmap(
-                lambda p: p + STEP[p[2]] + STEP[(p[2] + 1) % 4]
-            )(state.agent_locs)
-
-            right_oob_check = jax.vmap(
-                lambda t: jnp.logical_or(
-                    jnp.logical_or((t[0] > self.GRID_SIZE_ROW - 1).any(), (t[1] > self.GRID_SIZE_COL - 1).any()),
-                    (t < 0).any(),
+                # Vectorized OOB checks on XY only
+                max_x = self.GRID_SIZE_ROW - 1
+                max_y = self.GRID_SIZE_COL - 1
+                right_oob_check = (
+                    (target_right[:, 0] > max_x) | (target_right[:, 0] < 0) |
+                    (target_right[:, 1] > max_y) | (target_right[:, 1] < 0)
                 )
-            )(target_right)
-
-            target_right = jnp.where(
-                right_oob_check[:, None],
-                one_step_targets,
-                target_right
-            )
-
-            target_left = jax.vmap(
-                lambda p: p + STEP[p[2]] + STEP[(p[2] - 1) % 4]
-            )(state.agent_locs)
-
-            left_oob_check = jax.vmap(
-                lambda t: jnp.logical_or(
-                    jnp.logical_or((t[0] > self.GRID_SIZE_ROW - 1).any(), (t[1] > self.GRID_SIZE_COL - 1).any()),
-                    (t < 0).any(),
-                )
-            )(target_left)
-
-            target_left = jnp.where(
-                left_oob_check[:, None],
-                one_step_targets,
-                target_left
-            )
-
-            all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
-            # zaps_3d = jnp.stack([zaps, zaps, zaps], axis=-1)
-
-            zaps_4_locs = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
-
-
-            # all_zaped_locs = jax.vmap(filter_zaped_locs)(all_zaped_locs)
-
-            def zaped_gird(a, z):
-                return jnp.where(z, state.grid[a[0], a[1]], -1)
-
-            all_zaped_gird = jax.vmap(zaped_gird)(all_zaped_locs, zaps_4_locs)
-
-            def check_reborn_player(a):
-                return jnp.isin(a, all_zaped_gird)
-            
-            reborn_players = jax.vmap(check_reborn_player)(self._agents)
-
-            aux_grid = jnp.copy(state.grid)
-
-            o_items = jnp.where(
-                        state.grid[
-                            one_step_targets[:, 0],
-                            one_step_targets[:, 1]
-                        ],
-                        state.grid[
-                            one_step_targets[:, 0],
-                            one_step_targets[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            t_items = jnp.where(
-                        state.grid[
-                            two_step_targets[:, 0],
-                            two_step_targets[:, 1]
-                        ],
-                        state.grid[
-                            two_step_targets[:, 0],
-                            two_step_targets[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            r_items = jnp.where(
-                        state.grid[
-                            target_right[:, 0],
-                            target_right[:, 1]
-                        ],
-                        state.grid[
-                            target_right[:, 0],
-                            target_right[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            l_items = jnp.where(
-                        state.grid[
-                            target_left[:, 0],
-                            target_left[:, 1]
-                        ],
-                        state.grid[
-                            target_left[:, 0],
-                            target_left[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            qualified_to_zap = zaps.squeeze()
-
-            # update grid
-            def update_grid(a_i, t, i, grid):
-                return grid.at[t[:, 0], t[:, 1]].set(
-                    jax.vmap(jnp.where)(
-                        a_i,
-                        i,
-                        aux_grid[t[:, 0], t[:, 1]]
-                    )
+                left_oob_check = (
+                    (target_left[:, 0] > max_x) | (target_left[:, 0] < 0) |
+                    (target_left[:, 1] > max_y) | (target_left[:, 1] < 0)
                 )
 
-            aux_grid = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, target_right, r_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, target_left, l_items, aux_grid)
-
-            state = state.replace(
-                grid=jnp.where(
-                    jnp.any(zaps),
-                    aux_grid,
-                    state.grid
+                target_right = jnp.where(
+                    right_oob_check[:, None],
+                    one_step_targets,
+                    target_right
                 )
-            )
+                target_left = jnp.where(
+                    left_oob_check[:, None],
+                    one_step_targets,
+                    target_left
+                )
+
+                all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
+                zaps_4_locs = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
+
+                def zaped_gird(a, z):
+                    return jnp.where(z, st.grid[a[0], a[1]], -1)
+
+                all_zaped_gird = jax.vmap(zaped_gird)(all_zaped_locs, zaps_4_locs)
+
+                def check_reborn_player(a):
+                    return jnp.any(all_zaped_gird == a)
+
+                reborn_players = jax.vmap(check_reborn_player)(self._agents)
+
+                aux_grid = st.grid
+
+                o_items = jnp.where(
+                    st.grid[
+                        one_step_targets[:, 0],
+                        one_step_targets[:, 1]
+                    ],
+                    st.grid[
+                        one_step_targets[:, 0],
+                        one_step_targets[:, 1]
+                    ],
+                    interact_idx
+                )
+                t_items = jnp.where(
+                    st.grid[
+                        two_step_targets[:, 0],
+                        two_step_targets[:, 1]
+                    ],
+                    st.grid[
+                        two_step_targets[:, 0],
+                        two_step_targets[:, 1]
+                    ],
+                    interact_idx
+                )
+                r_items = jnp.where(
+                    st.grid[
+                        target_right[:, 0],
+                        target_right[:, 1]
+                    ],
+                    st.grid[
+                        target_right[:, 0],
+                        target_right[:, 1]
+                    ],
+                    interact_idx
+                )
+                l_items = jnp.where(
+                    st.grid[
+                        target_left[:, 0],
+                        target_left[:, 1]
+                    ],
+                    st.grid[
+                        target_left[:, 0],
+                        target_left[:, 1]
+                    ],
+                    interact_idx
+                )
+
+                qualified_to_zap = zaps.squeeze()
+
+                def update_grid(a_i, t, i, grid):
+                    return grid.at[t[:, 0], t[:, 1]].set(
+                        jax.vmap(jnp.where)(
+                            a_i,
+                            i,
+                            aux_grid[t[:, 0], t[:, 1]]
+                        )
+                    )
+
+                aux_grid2 = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid)
+                aux_grid2 = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid2)
+                aux_grid2 = update_grid(qualified_to_zap, target_right, r_items, aux_grid2)
+                aux_grid2 = update_grid(qualified_to_zap, target_left, l_items, aux_grid2)
+
+                st2 = st.replace(grid=aux_grid2)
+                return reborn_players, st2
+
+            def no_zap_branch(st: State):
+                return jnp.zeros((self.num_agents,), dtype=jnp.bool_), st
+
+            reborn_players, state = jax.lax.cond(any_zap, zap_branch, no_zap_branch, state)
             return reborn_players, state
         
         def _interact_fire_cleaning(
@@ -970,179 +915,137 @@ class Clean_up(MultiAgentEnv):
                 and index 3 is the new freeze penalty matrix.
             '''
             # if interact
-            zaps = jnp.isin(actions,
-                jnp.array(
-                    [
-                        Actions.zap_clean,
-                    ]
-                )
-            )
+            zaps = actions == Actions.zap_clean
 
             interact_idx = jnp.int16(Items.clean_beam)
 
-            # remove old interacts
-
+            any_zap = jnp.any(zaps)
+            # Always clear last-step cleaning beams
             state = state.replace(grid=jnp.where(
                 state.grid == interact_idx, jnp.int16(Items.empty), state.grid
             ))
 
-            one_step_targets = jax.vmap(
-                lambda p: p + STEP[p[2]]
-            )(state.agent_locs)
+            def clean_branch(st: State):
+                # Remove old beams of same type
+                g = jnp.where(st.grid == interact_idx, jnp.int16(Items.empty), st.grid)
+                st = st.replace(grid=g)
 
-            two_step_targets = jax.vmap(
-                lambda p: p + 2*STEP[p[2]]
-            )(state.agent_locs)
+                one_step_targets = jax.vmap(
+                    lambda p: p + STEP[p[2]]
+                )(st.agent_locs)
+                two_step_targets = jax.vmap(
+                    lambda p: p + 2 * STEP[p[2]]
+                )(st.agent_locs)
+                target_right = jax.vmap(
+                    lambda p: p + STEP[p[2]] + STEP[(p[2] + 1) % 4]
+                )(st.agent_locs)
+                target_left = jax.vmap(
+                    lambda p: p + STEP[p[2]] + STEP[(p[2] - 1) % 4]
+                )(st.agent_locs)
 
-            target_right = jax.vmap(
-                lambda p: p + STEP[p[2]] + STEP[(p[2] + 1) % 4]
-            )(state.agent_locs)
-
-            right_oob_check = jax.vmap(
-                lambda t: jnp.logical_or(
-                    jnp.logical_or((t[0] > self.GRID_SIZE_ROW - 1).any(), (t[1] > self.GRID_SIZE_COL - 1).any()),
-                    (t < 0).any(),
+                max_x = self.GRID_SIZE_ROW - 1
+                max_y = self.GRID_SIZE_COL - 1
+                right_oob_check = (
+                    (target_right[:, 0] > max_x) | (target_right[:, 0] < 0) |
+                    (target_right[:, 1] > max_y) | (target_right[:, 1] < 0)
                 )
-            )(target_right)
-
-            target_right = jnp.where(
-                right_oob_check[:, None],
-                one_step_targets,
-                target_right
-            )
-
-            target_left = jax.vmap(
-                lambda p: p + STEP[p[2]] + STEP[(p[2] - 1) % 4]
-            )(state.agent_locs)
-
-            left_oob_check = jax.vmap(
-                lambda t: jnp.logical_or(
-                    jnp.logical_or((t[0] > self.GRID_SIZE_ROW - 1).any(), (t[1] > self.GRID_SIZE_COL - 1).any()),
-                    (t < 0).any(),
+                left_oob_check = (
+                    (target_left[:, 0] > max_x) | (target_left[:, 0] < 0) |
+                    (target_left[:, 1] > max_y) | (target_left[:, 1] < 0)
                 )
-            )(target_left)
+                target_right = jnp.where(right_oob_check[:, None], one_step_targets, target_right)
+                target_left = jnp.where(left_oob_check[:, None], one_step_targets, target_left)
 
-            target_left = jnp.where(
-                left_oob_check[:, None],
-                one_step_targets,
-                target_left
-            )
+                all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
+                zaps_4_locs_judge = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
 
+                potential_dirt_all_zap = jnp.repeat(jnp.array(Items.potential_dirt), len(all_zaped_locs))
 
-            all_zaped_locs = jnp.concatenate((one_step_targets, two_step_targets, target_right, target_left), 0)
-            # zaps_3d = jnp.stack([zaps, zaps, zaps], axis=-1)
-
-            zaps_4_locs_judge = jnp.concatenate((zaps, zaps, zaps, zaps), 0)
-
-
-            # all_zaped_locs = jax.vmap(filter_zaped_locs)(all_zaped_locs)
-
-            potential_dirt_all_zap = jnp.repeat(jnp.array(Items.potential_dirt), len(all_zaped_locs))
-            # make clean gird
-            def clean_gird(a, judge):
-                return state.grid.at[a[:, 0], a[:, 1]].set(
-                    jax.vmap(jnp.where)(
-                        ((judge == True) & (state.grid[a[:, 0], a[:, 1]] == Items.dirt)),
-                        potential_dirt_all_zap,
-                        state.grid[a[:, 0], a[:, 1]]
+                def clean_gird(a, judge):
+                    return st.grid.at[a[:, 0], a[:, 1]].set(
+                        jax.vmap(jnp.where)(
+                            ((judge == True) & (st.grid[a[:, 0], a[:, 1]] == Items.dirt)),
+                            potential_dirt_all_zap,
+                            st.grid[a[:, 0], a[:, 1]]
+                        )
                     )
+
+                grid_clean = clean_gird(all_zaped_locs, zaps_4_locs_judge.squeeze())
+                st = st.replace(grid=grid_clean)
+
+                def renew_dirt_label(locs, labels):
+                    v = grid_clean[locs[0], locs[1]]
+                    return jnp.where((v == Items.dirt) | (v == Items.potential_dirt), v, labels)
+
+                renew_label = jax.vmap(renew_dirt_label)(st.potential_dirt_and_dirt_locs, st.potential_dirt_and_dirt_label)
+                st = st.replace(potential_dirt_and_dirt_label=renew_label)
+
+                aux_grid = st.grid
+                o_items = jnp.where(
+                    st.grid[
+                        one_step_targets[:, 0],
+                        one_step_targets[:, 1]
+                    ],
+                    st.grid[
+                        one_step_targets[:, 0],
+                        one_step_targets[:, 1]
+                    ],
+                    interact_idx
                 )
-            
-            
-            grid_clean = clean_gird(all_zaped_locs, zaps_4_locs_judge.squeeze())
-            state = state.replace(grid=grid_clean)
-
-            # refresh label
-
-            def renew_dirt_label(locs, labels):
-                return jnp.where((grid_clean[locs[0], locs[1]] == Items.dirt) | (grid_clean[locs[0], locs[1]] == Items.potential_dirt), grid_clean[locs[0], locs[1]], labels)
-
-
-            renew_label = jax.vmap(renew_dirt_label)(state.potential_dirt_and_dirt_locs, state.potential_dirt_and_dirt_label)
-
-
-            state = state.replace(
-                potential_dirt_and_dirt_label=renew_label
-            )
-
-            aux_grid = jnp.copy(state.grid)
-
-            o_items = jnp.where(
-                        state.grid[
-                            one_step_targets[:, 0],
-                            one_step_targets[:, 1]
-                        ],
-                        state.grid[
-                            one_step_targets[:, 0],
-                            one_step_targets[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            t_items = jnp.where(
-                        state.grid[
-                            two_step_targets[:, 0],
-                            two_step_targets[:, 1]
-                        ],
-                        state.grid[
-                            two_step_targets[:, 0],
-                            two_step_targets[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            r_items = jnp.where(
-                        state.grid[
-                            target_right[:, 0],
-                            target_right[:, 1]
-                        ],
-                        state.grid[
-                            target_right[:, 0],
-                            target_right[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            l_items = jnp.where(
-                        state.grid[
-                            target_left[:, 0],
-                            target_left[:, 1]
-                        ],
-                        state.grid[
-                            target_left[:, 0],
-                            target_left[:, 1]
-                        ],
-                        interact_idx
-                    )
-
-            qualified_to_zap = zaps.squeeze()
-
-
-            # update grid
-            def update_grid(a_i, t, i, grid):
-                return grid.at[t[:, 0], t[:, 1]].set(
-                    jax.vmap(jnp.where)(
-                        a_i,
-                        i,
-                        aux_grid[t[:, 0], t[:, 1]]
-                    )
+                t_items = jnp.where(
+                    st.grid[
+                        two_step_targets[:, 0],
+                        two_step_targets[:, 1]
+                    ],
+                    st.grid[
+                        two_step_targets[:, 0],
+                        two_step_targets[:, 1]
+                    ],
+                    interact_idx
+                )
+                r_items = jnp.where(
+                    st.grid[
+                        target_right[:, 0],
+                        target_right[:, 1]
+                    ],
+                    st.grid[
+                        target_right[:, 0],
+                        target_right[:, 1]
+                    ],
+                    interact_idx
+                )
+                l_items = jnp.where(
+                    st.grid[
+                        target_left[:, 0],
+                        target_left[:, 1]
+                    ],
+                    st.grid[
+                        target_left[:, 0],
+                        target_left[:, 1]
+                    ],
+                    interact_idx
                 )
 
+                qualified_to_zap = zaps.squeeze()
 
+                def update_grid(a_i, t, i, grid):
+                    return grid.at[t[:, 0], t[:, 1]].set(
+                        jax.vmap(jnp.where)(
+                            a_i,
+                            i,
+                            aux_grid[t[:, 0], t[:, 1]]
+                        )
+                    )
 
-            aux_grid = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, target_right, r_items, aux_grid)
-            aux_grid = update_grid(qualified_to_zap, target_left, l_items, aux_grid)
+                aux_grid2 = update_grid(qualified_to_zap, one_step_targets, o_items, aux_grid)
+                aux_grid2 = update_grid(qualified_to_zap, two_step_targets, t_items, aux_grid2)
+                aux_grid2 = update_grid(qualified_to_zap, target_right, r_items, aux_grid2)
+                aux_grid2 = update_grid(qualified_to_zap, target_left, l_items, aux_grid2)
 
+                st = st.replace(grid=aux_grid2)
+                return st
 
-            state = state.replace(
-                grid=jnp.where(
-                    jnp.any(zaps),
-                    aux_grid,
-                    state.grid
-                )
-            )
+            state = jax.lax.cond(any_zap, clean_branch, lambda s: s, state)
             return state
 
 
@@ -1153,22 +1056,30 @@ class Clean_up(MultiAgentEnv):
         ):
             """Step the environment."""
 
+            # Split PRNG upfront for determinism and to avoid reuse
+            key, k_apple, k_dirt_noise, k_dirt_p, k_collision, k_respawn_perm, k_respawn_dir = jax.random.split(key, 7)
+
             # regrowth of apply
             grid_apple = state.grid
             dirtCount = jnp.sum(state.potential_dirt_and_dirt_label == Items.dirt)
-            dirtFraction = dirtCount / (len(state.potential_dirt_and_dirt_locs) + len(self.RIVER))
-            depletion = self.thresholdDepletion
-            restoration = self.thresholdRestoration
+            denom = jnp.asarray(len(state.potential_dirt_and_dirt_locs) + len(self.RIVER), dtype=jnp.bfloat16)
+            dirtFraction = jnp.asarray(dirtCount, dtype=jnp.bfloat16) / denom
+            depletion = jnp.asarray(self.thresholdDepletion, dtype=jnp.bfloat16)
+            restoration = jnp.asarray(self.thresholdRestoration, dtype=jnp.bfloat16)
             interpolation = (dirtFraction - depletion) / (restoration - depletion)
 
-            interpolation = jnp.clip(interpolation, -jnp.inf, 1.0)
-            probability = self.maxAppleGrowthRate * interpolation
+            interpolation = jnp.clip(
+                interpolation,
+                jnp.finfo(jnp.bfloat16).min,
+                jnp.asarray(1.0, dtype=jnp.bfloat16),
+            )
+            probability = jnp.asarray(self.maxAppleGrowthRate, dtype=jnp.bfloat16) * interpolation
             def regrow_apple(apple_locs, p):
                 new_apple = jnp.where((((grid_apple[apple_locs[0], apple_locs[1]] == Items.empty) & (p < probability)) 
                                        | ((grid_apple[apple_locs[0], apple_locs[1]] == Items.apple))),  
                                       Items.apple, Items.empty)
                 return new_apple
-            prob = jax.random.uniform(key, shape=(len(self.POTENTIAL_APPLE),))
+            prob = jax.random.uniform(k_apple, shape=(len(self.POTENTIAL_APPLE),), dtype=jnp.bfloat16)
             new_apple = jax.vmap(regrow_apple)(self.POTENTIAL_APPLE, prob)
 
             new_apple_grid = grid_apple.at[self.POTENTIAL_APPLE[:, 0], self.POTENTIAL_APPLE[:, 1]].set(new_apple)
@@ -1177,7 +1088,11 @@ class Clean_up(MultiAgentEnv):
             # DirtSpawning update the grid and potential_dirt_and_dirt_label
             grid_dirt = state.grid
 
-            noise = jax.random.uniform(key, shape=(len(state.potential_dirt_and_dirt_label),)) * 1e-4
+            noise = jax.random.uniform(
+                k_dirt_noise,
+                shape=(len(state.potential_dirt_and_dirt_label),),
+                dtype=jnp.bfloat16,
+            ) * jnp.asarray(1e-4, dtype=jnp.bfloat16)
             label_with_noise = state.potential_dirt_and_dirt_label + noise
 
             label_with_noise_rank = jnp.sort(label_with_noise)
@@ -1185,9 +1100,9 @@ class Clean_up(MultiAgentEnv):
 
             unstable_sorted_locs = state.potential_dirt_and_dirt_locs[unstable_indices]
             
-            p = jax.random.uniform(key, shape=(1,)) 
+            p = jax.random.uniform(k_dirt_p, shape=(1,), dtype=jnp.bfloat16) 
             one_piece_dirt = jnp.where(((grid_dirt[unstable_sorted_locs[0, 0], unstable_sorted_locs[0, 1]] == Items.potential_dirt) 
-                                       & (p < self.dirtSpawnProbability) & (state.inner_t>self.delayStartOfDirtSpawning)),  
+                                       & (p < jnp.asarray(self.dirtSpawnProbability, dtype=jnp.bfloat16)) & (state.inner_t>self.delayStartOfDirtSpawning)),  
                         Items.dirt, label_with_noise_rank[0])
 
             label_with_noise_rank_new = label_with_noise_rank.at[0].set(one_piece_dirt[0]) 
@@ -1214,7 +1129,6 @@ class Clean_up(MultiAgentEnv):
             state = state.replace(grid=new_grid)
             state = state.replace(agent_locs=state.reborn_locs)
 
-            key, subkey = jax.random.split(key)
             all_new_locs = jax.vmap(lambda p, a: jnp.int16(p + ROTATIONS[a]) % jnp.array([self.GRID_SIZE_ROW + 1, self.GRID_SIZE_COL + 1, 4], dtype=jnp.int16))(p=state.agent_locs, a=actions).squeeze()
 
             agent_move = (actions == Actions.up) | (actions == Actions.down) | (actions == Actions.right) | (actions == Actions.left)
@@ -1257,7 +1171,7 @@ class Clean_up(MultiAgentEnv):
             new_locs = jax.lax.cond(
                 jnp.max(collided_moved) > 0,
                 lambda: fix_collisions(
-                    key,
+                    k_collision,
                     collided_moved,
                     collision_matrix,
                     state.agent_locs,
@@ -1313,31 +1227,32 @@ class Clean_up(MultiAgentEnv):
 
             # jax.debug.print("reborn_players_3d {reborn_players_3d} 🤯", reborn_players_3d=reborn_players_3d)
 
-            re_agents_pos = jax.random.permutation(subkey, self.SPAWNS_PLAYERS)[:num_agents]
+            def respawn_branch(_):
+                re_agents_pos = jax.random.permutation(k_respawn_perm, self.SPAWNS_PLAYERS)[:num_agents]
+                player_dir = jax.random.randint(
+                    k_respawn_dir, shape=(num_agents,), minval=0, maxval=3, dtype=jnp.int8
+                )
+                re_agent_locs = jnp.array(
+                    [re_agents_pos[:, 0], re_agents_pos[:, 1], player_dir],
+                    dtype=jnp.int16
+                ).T
+                new_re_locs_inner = jnp.where(~reborn_players_3d, new_locs, re_agent_locs)
+                return new_re_locs_inner
 
-            player_dir = jax.random.randint(
-                subkey, shape=(
-                    num_agents,
-                    ), minval=0, maxval=3, dtype=jnp.int8
-            )
+            def no_respawn_branch(_):
+                return state.agent_locs
 
-            re_agent_locs = jnp.array(
-                [re_agents_pos[:, 0], re_agents_pos[:, 1], player_dir],
-                dtype=jnp.int16
-            ).T
-
-            new_re_locs = jnp.where(reborn_players_3d == False, new_locs, re_agent_locs)
-            new_re_locs = jnp.where(reborn_players.any(), new_re_locs, state.agent_locs)
+            new_re_locs = jax.lax.cond(reborn_players.any(), respawn_branch, no_respawn_branch, operand=None)
             state = state.replace(reborn_locs=new_re_locs)
 
             # Calculate base rewards
-            base_rewards = jnp.zeros((self.num_agents, 1))
+            base_rewards = jnp.zeros((self.num_agents, 1), dtype=jnp.bfloat16)
             base_apple_rewards = jnp.where(apple_matches, 1, base_rewards)
             
             # Apply reward type logic
             if self.reward_type == "shared":
                 # Shared rewards: all agents get sum of all rewards
-                rewards_sum_all_agents = jnp.zeros((self.num_agents, 1))
+                rewards_sum_all_agents = jnp.zeros((self.num_agents, 1), dtype=jnp.bfloat16)
                 rewards_sum = jnp.sum(base_apple_rewards)
                 rewards_sum_all_agents += rewards_sum
                 rewards = rewards_sum_all_agents
@@ -1358,8 +1273,8 @@ class Clean_up(MultiAgentEnv):
 
                 coef = jax.lax.cond(
                     max_apples == 0,
-                    lambda _: jnp.ones_like(agent_apple_counts, dtype=jnp.float32),
-                    lambda _: 1.0 - agent_apple_counts / max_apples + 0.2,
+                    lambda _: jnp.ones_like(agent_apple_counts, dtype=jnp.bfloat16),
+                    lambda _: jnp.asarray(1.0, dtype=jnp.bfloat16) - jnp.asarray(agent_apple_counts, dtype=jnp.bfloat16) / jnp.asarray(max_apples, dtype=jnp.bfloat16) + jnp.asarray(0.2, dtype=jnp.bfloat16),
                     operand=max_apples,
                 )
                 
@@ -1376,7 +1291,7 @@ class Clean_up(MultiAgentEnv):
             elif self.reward_type == "fractional":
                 # Fractional rewards: agents get individual rewards + 0.1 * team total
                 team_total_reward = jnp.sum(base_apple_rewards)
-                fractional_team_bonus = 0.1 * team_total_reward
+                fractional_team_bonus = jnp.asarray(0.5, dtype=jnp.bfloat16) * team_total_reward
                 
                 # Each agent gets their individual reward + fractional team bonus
                 fractional_rewards = base_apple_rewards + fractional_team_bonus
@@ -1430,7 +1345,7 @@ class Clean_up(MultiAgentEnv):
             obs = _get_obs(state)
             rewards = jnp.where(
                 reset_inner,
-                jnp.zeros_like(rewards, dtype=jnp.int16),
+                jnp.zeros_like(rewards),
                 rewards
             )
 
