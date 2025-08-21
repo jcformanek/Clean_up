@@ -4,6 +4,3 @@ chex==0.1.89
 distrax
 wandb
 pillow
-tensorflow
-tensorboard
-tensorboard-plugin-profile

@@ -14,12 +14,10 @@ from typing import Sequence, NamedTuple, Any
 from flax.training.train_state import TrainState
 import distrax
 import wandb
-import copy
 import pickle
 import os
 from PIL import Image
 from pathlib import Path
-import orbax
 import argparse
 
 from clean_up.wrappers import LogWrapper
